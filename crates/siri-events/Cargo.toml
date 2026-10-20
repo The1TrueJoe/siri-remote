@@ -1,0 +1,18 @@
+[package]
+name = "siri-events"
+description = "Stream Siri Remote events as newline-delimited JSON, for glue in any language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "siri-events"
+path = "src/main.rs"
+
+[dependencies]
+siri-remote = { path = "../siri-remote", features = ["opus", "bluez"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+anyhow = "1"

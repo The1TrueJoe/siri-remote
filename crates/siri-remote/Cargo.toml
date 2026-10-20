@@ -1,0 +1,31 @@
+[package]
+name = "siri-remote"
+description = "Apple TV Siri Remote over BLE: buttons, touchpad, swipes, battery and microphone audio, as an event stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = "0.2"
+thiserror = "2"
+tracing = "0.1"
+
+# Only for the optional `bluez` feature (discovery and pairing).
+bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
+tokio = { version = "1", features = ["time"], optional = true }
+futures-util = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = ["opus"]
+# Decode the microphone stream. Links the system libopus.
+opus = []
+# Discovery and pairing through BlueZ. Pulls in an async D-Bus stack; the rest
+# of the crate stays synchronous without it.
+bluez = ["dep:bluer", "dep:tokio", "dep:futures-util", "dep:serde"]
+# Derive Serialize on event and report types, for glue that emits JSON.
+serde = ["dep:serde"]
+
+[[example]]
+name = "print_events"

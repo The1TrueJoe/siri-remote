@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/siri-remote", "crates/siri-events"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/The1TrueJoe/siri-remote"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
