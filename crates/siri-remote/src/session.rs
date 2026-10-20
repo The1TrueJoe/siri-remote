@@ -3,8 +3,17 @@
 use std::time::{Duration, Instant};
 
 use crate::att::{AttSocket, BDADDR_LE_PUBLIC, BT_SECURITY_MEDIUM};
-use crate::error::Result;
-use crate::protocol::{self as proto, Button, Buttons, Finger, Report};
+use crate::error::{Error, Result};
+use crate::hci::ConnParams;
+use crate::protocol::{self as proto, AudioFrame, Button, Buttons, Codec, Finger, Report};
+
+/// After Siri is released the remote keeps streaming a short tail, then simply
+/// stops — the A1513 sends no end marker. A gap this long ends the utterance.
+const TAIL_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// Conceal at most this many consecutive lost frames (0.5 s). A bigger jump in
+/// stream time means a new stream rather than a hole in this one.
+const MAX_CONCEALED_RUN: usize = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerState {
@@ -29,13 +38,16 @@ impl PowerState {
 #[derive(Debug, Clone)]
 pub enum Event {
     Connected {
-        /// Negotiated ATT MTU. Below [`proto::MIN_MTU`] the microphone cannot
-        /// be carried — see [`Event::AudioUnavailable`].
+        /// Negotiated ATT MTU. Informational: the remote answers 23 to every
+        /// host and sends larger audio notifications regardless.
         mtu: u16,
+        /// Largest PDU the kernel will accept on this link. Below
+        /// [`proto::MIN_MTU`] audio frames would be truncated — see
+        /// [`Event::AudioUnavailable`].
         kernel_rcv_mtu: u16,
     },
-    /// The link is up but the MTU is too small for microphone audio. Buttons
-    /// and touch still work.
+    /// The kernel socket cannot accept whole microphone frames. Buttons and
+    /// touch still work.
     AudioUnavailable {
         mtu: u16,
         needed: u16,
@@ -51,12 +63,20 @@ pub enum Event {
     /// Siri was pressed; microphone frames follow.
     VoiceStart,
     /// One decoded 20 ms chunk, streamed as it arrives so a recogniser can
-    /// consume it live rather than waiting for the button to be released.
+    /// consume it live rather than waiting for the utterance to end. Lost
+    /// frames are filled with concealment, so the chunks keep real time.
     VoiceAudio(Vec<i16>),
+    /// The utterance is over: Siri was released and the remote's tail has
+    /// finished streaming.
     VoiceEnd {
         pcm: Vec<i16>,
+        /// Frames received.
         frames: usize,
+        /// Frames received but not decodable.
         undecodable: usize,
+        /// Frames lost in transit and filled in by the decoder.
+        concealed: usize,
+        /// How long Siri was held.
         held: Duration,
     },
     Disconnected(String),
@@ -68,14 +88,13 @@ pub struct SessionConfig {
     pub sec_level: u8,
     pub want_mtu: u16,
     /// Local adapter to connect through, by BD address. `None` lets the kernel
-    /// choose, which is only unambiguous with a single adapter. Microphone
-    /// audio needs a Bluetooth 4.2+ controller, so on a machine with both a
-    /// built-in radio and a dongle this should name the dongle.
+    /// choose, which is only unambiguous with a single adapter.
     pub adapter: Option<String>,
-    /// How long to let the remote initiate the MTU exchange before asking
-    /// ourselves. Asking first caps the link at MTU 23 and silently disables
-    /// the microphone, so this wait is what makes audio possible.
-    pub peer_mtu_wait: Duration,
+    /// Connection parameters to request once connected. The kernel's default
+    /// interval is too slow for the microphone, which then lags further behind
+    /// the longer you speak. Needs `CAP_NET_RAW`; without it the link keeps
+    /// the default and everything else still works. `None` leaves it alone.
+    pub conn_params: Option<ConnParams>,
     /// How long to keep a connect pending while waiting for a button press.
     pub connect_timeout: Duration,
 }
@@ -88,7 +107,7 @@ impl SessionConfig {
             sec_level: BT_SECURITY_MEDIUM,
             want_mtu: 517,
             adapter: None,
-            peer_mtu_wait: Duration::from_secs(5),
+            conn_params: Some(ConnParams::VOICE),
             connect_timeout: Duration::from_secs(900),
         }
     }
@@ -123,20 +142,8 @@ impl Session {
             on_retry,
         )?;
 
-        // Let the remote ask for the MTU first. It offers a Client RX MTU of
-        // 104 when it initiates, but answers 23 if we ask — and 101-byte audio
-        // frames only fit under the former. See AttSocket::await_peer_mtu.
-        let (peer_mtu, buffered) =
-            sock.await_peer_mtu(cfg.peer_mtu_wait, cfg.want_mtu);
-
         sock.write_req(proto::H_ENABLE, &[proto::ENABLE_BYTE])?;
-
-        let mtu = match peer_mtu {
-            Some(m) => m,
-            // The remote stayed quiet; fall back to asking, which still gets
-            // buttons and touch working even though audio will not fit.
-            None => sock.exchange_mtu(cfg.want_mtu).unwrap_or(23),
-        };
+        let mtu = sock.exchange_mtu(cfg.want_mtu).unwrap_or(23);
 
         for cccd in [
             proto::H_INPUT_CCCD,
@@ -148,15 +155,25 @@ impl Session {
             let _ = sock.write_req(cccd, &[0x01, 0x00]);
         }
 
+        if let Some(params) = &cfg.conn_params {
+            match sock.request_conn_params(params) {
+                Ok(handle) => tracing::debug!(handle, ?params, "requested connection parameters"),
+                Err(e) => tracing::warn!(
+                    "could not request a faster connection interval ({e}); \
+                     microphone audio will lag on long utterances"
+                ),
+            }
+        }
+
         if !on_event(Event::Connected {
             mtu,
             kernel_rcv_mtu: sock.kernel_rcv_mtu,
         }) {
             return Ok(());
         }
-        if mtu < proto::MIN_MTU {
+        if sock.kernel_rcv_mtu < proto::MIN_MTU {
             if !on_event(Event::AudioUnavailable {
-                mtu,
+                mtu: sock.kernel_rcv_mtu,
                 needed: proto::MIN_MTU,
             }) {
                 return Ok(());
@@ -166,25 +183,24 @@ impl Session {
         let mut held = Buttons::default();
         let mut voice = VoiceSession::default();
 
-        // Replay anything that arrived while we waited for the MTU exchange.
-        for (handle, data) in buffered {
-            if handle == proto::H_INPUT {
-                if let Report::Buttons(b) = proto::parse(&data) {
-                    if !Self::emit_transitions(b, &mut held, &mut voice, on_event) {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
         loop {
-            let (handle, data) = match sock.next_notification(None) {
+            let timeout = voice.awaiting_tail().then_some(TAIL_TIMEOUT);
+            let (handle, data) = match sock.next_notification(timeout) {
                 Ok(v) => v,
-                Err(e) => {
-                    if voice.active {
-                        if let Some(ev) = voice.finish() {
-                            on_event(ev);
+                Err(Error::Io(e))
+                    if timeout.is_some() && e.raw_os_error() == Some(libc::ETIMEDOUT) =>
+                {
+                    // The tail has run out: the utterance is complete.
+                    if let Some(ev) = voice.finish() {
+                        if !on_event(ev) {
+                            return Ok(());
                         }
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    if let Some(ev) = voice.finish() {
+                        on_event(ev);
                     }
                     on_event(Event::Disconnected(e.to_string()));
                     return Err(e);
@@ -209,13 +225,41 @@ impl Session {
                     }
                 }
                 proto::H_INPUT => {
-                    match proto::parse(&data) {
-                        Report::Audio { opus, .. } => {
-                            if let Some(pkt) = opus {
-                                if let Some(pcm) = voice.push(&pkt) {
+                    let report = proto::parse(&data);
+
+                    // The remote sends nothing but audio while it streams, so
+                    // any other report after a release means the stream is
+                    // over and the tail has been delivered.
+                    if voice.awaiting_tail() && !matches!(report, Report::Audio { .. }) {
+                        if let Some(ev) = voice.finish() {
+                            if !on_event(ev) {
+                                return Ok(());
+                            }
+                        }
+                    }
+
+                    match report {
+                        Report::Audio { buttons, frame, .. } => {
+                            // Presses and releases made mid-stream only show
+                            // up here, in the frame's button byte.
+                            if !Self::emit_transitions(buttons, &mut held, &mut voice, &mut sock, on_event) {
+                                return Ok(());
+                            }
+                            if let Some(frame) = frame {
+                                for pcm in voice.push(&frame) {
                                     if !on_event(Event::VoiceAudio(pcm)) {
                                         return Ok(());
                                     }
+                                }
+                            }
+                        }
+                        Report::AudioEnd(buttons) => {
+                            if !Self::emit_transitions(buttons, &mut held, &mut voice, &mut sock, on_event) {
+                                return Ok(());
+                            }
+                            if let Some(ev) = voice.finish() {
+                                if !on_event(ev) {
+                                    return Ok(());
                                 }
                             }
                         }
@@ -227,12 +271,12 @@ impl Session {
                             if !on_event(Event::Touch { fingers, pressed }) {
                                 return Ok(());
                             }
-                            if !Self::emit_transitions(buttons, &mut held, &mut voice, on_event) {
+                            if !Self::emit_transitions(buttons, &mut held, &mut voice, &mut sock, on_event) {
                                 return Ok(());
                             }
                         }
                         Report::Buttons(buttons) => {
-                            if !Self::emit_transitions(buttons, &mut held, &mut voice, on_event) {
+                            if !Self::emit_transitions(buttons, &mut held, &mut voice, &mut sock, on_event) {
                                 return Ok(());
                             }
                         }
@@ -248,11 +292,23 @@ impl Session {
         now: Buttons,
         held: &mut Buttons,
         voice: &mut VoiceSession,
+        sock: &mut AttSocket,
         on_event: &mut impl FnMut(Event) -> bool,
     ) -> bool {
         for b in now.newly_pressed(*held) {
             if b == Button::Siri {
+                // A press during the previous utterance's tail starts a new
+                // one; the remote just keeps streaming.
+                if let Some(ev) = voice.finish() {
+                    if !on_event(ev) {
+                        return false;
+                    }
+                }
                 voice.start();
+                // Siri only arms the microphone; this starts the stream.
+                if let Err(e) = sock.write_req(proto::H_ENABLE, &proto::STREAM_START) {
+                    tracing::warn!("could not start the microphone stream: {e}");
+                }
                 if !on_event(Event::VoiceStart) {
                     return false;
                 }
@@ -266,11 +322,7 @@ impl Session {
                 return false;
             }
             if b == Button::Siri {
-                if let Some(ev) = voice.finish() {
-                    if !on_event(ev) {
-                        return false;
-                    }
-                }
+                voice.release();
             }
         }
         *held = now;
@@ -278,30 +330,74 @@ impl Session {
     }
 }
 
-/// Accumulates a Siri press: decodes each frame as it arrives so the audio can
-/// be streamed onward live.
+/// A frame decoder for whichever codec this remote uses.
+enum Decoder {
+    #[cfg(feature = "opus")]
+    Opus(crate::audio::OpusDecoder),
+    #[cfg(feature = "speex")]
+    Speex(crate::audio::SpeexDecoder),
+}
+
+impl Decoder {
+    fn new(codec: Codec) -> Option<Decoder> {
+        match codec {
+            #[cfg(feature = "opus")]
+            Codec::Opus => {
+                crate::audio::OpusDecoder::new(proto::AUDIO_SAMPLE_RATE, proto::AUDIO_CHANNELS)
+                    .ok()
+                    .map(Decoder::Opus)
+            }
+            #[cfg(feature = "speex")]
+            Codec::Speex => crate::audio::SpeexDecoder::new().ok().map(Decoder::Speex),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    // `match *self` so this still compiles with both codecs disabled, when
+    // `Decoder` has no variants at all.
+    fn codec(&self) -> Codec {
+        match *self {
+            #[cfg(feature = "opus")]
+            Decoder::Opus(_) => Codec::Opus,
+            #[cfg(feature = "speex")]
+            Decoder::Speex(_) => Codec::Speex,
+        }
+    }
+
+    #[cfg_attr(not(any(feature = "opus", feature = "speex")), allow(unused_variables))]
+    fn decode(&mut self, payload: &[u8]) -> Option<Vec<i16>> {
+        match *self {
+            #[cfg(feature = "opus")]
+            Decoder::Opus(ref mut d) => d.decode(payload).ok(),
+            #[cfg(feature = "speex")]
+            Decoder::Speex(ref mut d) => d.decode(payload).ok(),
+        }
+    }
+
+    fn conceal(&mut self) -> Option<Vec<i16>> {
+        match *self {
+            #[cfg(feature = "opus")]
+            Decoder::Opus(ref mut d) => d.conceal().ok(),
+            #[cfg(feature = "speex")]
+            Decoder::Speex(ref mut d) => d.conceal().ok(),
+        }
+    }
+}
+
+/// Accumulates one utterance: decodes each frame as it arrives so the audio
+/// can be streamed onward live.
+#[derive(Default)]
 struct VoiceSession {
     active: bool,
     started: Option<Instant>,
+    released: Option<Instant>,
     frames: usize,
     undecodable: usize,
+    concealed: usize,
+    last_time: Option<f32>,
     pcm: Vec<i16>,
-    #[cfg(feature = "opus")]
-    decoder: Option<crate::audio::OpusDecoder>,
-}
-
-impl Default for VoiceSession {
-    fn default() -> Self {
-        VoiceSession {
-            active: false,
-            started: None,
-            frames: 0,
-            undecodable: 0,
-            pcm: Vec::new(),
-            #[cfg(feature = "opus")]
-            decoder: None,
-        }
-    }
+    decoder: Option<Decoder>,
 }
 
 impl VoiceSession {
@@ -311,51 +407,87 @@ impl VoiceSession {
             started: Some(Instant::now()),
             ..Default::default()
         };
-        #[cfg(feature = "opus")]
-        {
-            self.decoder =
-                crate::audio::OpusDecoder::new(proto::AUDIO_SAMPLE_RATE, proto::AUDIO_CHANNELS)
-                    .ok();
+    }
+
+    fn release(&mut self) {
+        if self.active && self.released.is_none() {
+            self.released = Some(Instant::now());
         }
     }
 
-    fn push(&mut self, packet: &[u8]) -> Option<Vec<i16>> {
+    /// Siri is up and the tail is still arriving.
+    fn awaiting_tail(&self) -> bool {
+        self.active && self.released.is_some()
+    }
+
+    /// Lost frames before `frame`, from the jump in stream time.
+    fn missing_before(&self, frame: &AudioFrame) -> usize {
+        let (Some(prev), Some(now)) = (self.last_time, frame.time) else {
+            return 0;
+        };
+        let steps = ((now - prev) / proto::AUDIO_FRAME_SECONDS).round() as i64;
+        if steps > 1 && (steps - 1) as usize <= MAX_CONCEALED_RUN {
+            (steps - 1) as usize
+        } else {
+            0
+        }
+    }
+
+    /// Decode one frame, preceded by concealment for any frames lost before
+    /// it. Returns the PCM chunks in order.
+    fn push(&mut self, frame: &AudioFrame) -> Vec<Vec<i16>> {
         if !self.active {
-            // Audio without a Siri press: still count it rather than drop it
+            // Audio without a Siri press: still collect it rather than drop it
             // silently, since that would hide a protocol surprise.
             self.start();
         }
         self.frames += 1;
-        #[cfg(feature = "opus")]
-        {
-            let dec = self.decoder.as_mut()?;
-            match dec.decode(packet) {
-                Ok(pcm) => {
-                    self.pcm.extend_from_slice(&pcm);
-                    return Some(pcm);
-                }
-                Err(_) => {
-                    self.undecodable += 1;
-                    return None;
-                }
+
+        if self.decoder.as_ref().map(Decoder::codec) != Some(frame.codec) {
+            self.decoder = Decoder::new(frame.codec);
+        }
+        let missing = self.missing_before(frame);
+        if frame.time.is_some() {
+            self.last_time = frame.time;
+        }
+
+        let mut out = Vec::new();
+        let Some(dec) = self.decoder.as_mut() else {
+            self.undecodable += 1;
+            return out;
+        };
+        for _ in 0..missing {
+            if let Some(pcm) = dec.conceal() {
+                self.concealed += 1;
+                self.pcm.extend_from_slice(&pcm);
+                out.push(pcm);
             }
         }
-        #[cfg(not(feature = "opus"))]
-        {
-            let _ = packet;
-            None
+        match dec.decode(&frame.payload) {
+            Some(pcm) => {
+                self.pcm.extend_from_slice(&pcm);
+                out.push(pcm);
+            }
+            None => self.undecodable += 1,
         }
+        out
     }
 
     fn finish(&mut self) -> Option<Event> {
         if !self.active {
             return None;
         }
+        let held = match (self.started, self.released) {
+            (Some(s), Some(r)) => r.duration_since(s),
+            (Some(s), None) => s.elapsed(),
+            _ => Duration::ZERO,
+        };
         let ev = Event::VoiceEnd {
             pcm: std::mem::take(&mut self.pcm),
             frames: self.frames,
             undecodable: self.undecodable,
-            held: self.started.map(|s| s.elapsed()).unwrap_or_default(),
+            concealed: self.concealed,
+            held,
         };
         *self = VoiceSession::default();
         Some(ev)
@@ -388,5 +520,62 @@ mod tests {
             other => panic!("expected VoiceEnd, got {other:?}"),
         }
         assert!(!v.active);
+    }
+
+    #[test]
+    fn utterance_stays_open_through_the_tail() {
+        let mut v = VoiceSession::default();
+        v.start();
+        assert!(!v.awaiting_tail());
+        v.release();
+        assert!(v.awaiting_tail(), "release waits for the tail, not ends");
+        assert!(v.finish().is_some());
+        assert!(!v.awaiting_tail());
+    }
+
+    fn speex_at(time: f32) -> AudioFrame {
+        AudioFrame {
+            codec: Codec::Speex,
+            payload: vec![],
+            time: Some(time),
+        }
+    }
+
+    #[test]
+    fn gaps_in_stream_time_count_as_lost_frames() {
+        let mut v = VoiceSession::default();
+        v.last_time = Some(0.10);
+        assert_eq!(v.missing_before(&speex_at(0.12)), 0);
+        assert_eq!(v.missing_before(&speex_at(0.16)), 2);
+        // A jump this large is a new stream, not a hole to fill.
+        assert_eq!(v.missing_before(&speex_at(5.0)), 0);
+        // Time going backwards is a restart, not loss.
+        assert_eq!(v.missing_before(&speex_at(0.02)), 0);
+    }
+
+    #[cfg(feature = "speex")]
+    #[test]
+    fn concealment_fills_lost_frames_with_audio() {
+        use crate::protocol::test_frames::{unhex, SPEEX_NOTIFICATION};
+        let Report::Audio { frame: Some(first), .. } = proto::parse(&unhex(SPEEX_NOTIFICATION)) else {
+            panic!("fixture is not an audio frame");
+        };
+        let mut v = VoiceSession::default();
+        v.start();
+        assert_eq!(v.push(&first).len(), 1);
+        // Same frame, three steps later: two frames went missing.
+        let mut later = first.clone();
+        later.time = first.time.map(|t| t + 3.0 * proto::AUDIO_FRAME_SECONDS);
+        let chunks = v.push(&later);
+        assert_eq!(chunks.len(), 3, "two concealed, one decoded");
+        assert!(chunks.iter().all(|c| c.len() == 320));
+        match v.finish() {
+            Some(Event::VoiceEnd { frames, concealed, pcm, .. }) => {
+                assert_eq!(frames, 2);
+                assert_eq!(concealed, 2);
+                assert_eq!(pcm.len(), 4 * 320);
+            }
+            other => panic!("expected VoiceEnd, got {other:?}"),
+        }
     }
 }

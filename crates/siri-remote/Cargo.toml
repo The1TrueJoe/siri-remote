@@ -18,9 +18,11 @@ futures-util = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
-default = ["opus"]
-# Decode the microphone stream. Links the system libopus.
+default = ["opus", "speex"]
+# Decode the A1962's microphone stream. Links the system libopus.
 opus = []
+# Decode the A1513's microphone stream. Links the system libspeex.
+speex = []
 # Discovery and pairing through BlueZ. Pulls in an async D-Bus stack; the rest
 # of the crate stays synchronous without it.
 bluez = ["dep:bluer", "dep:tokio", "dep:futures-util", "dep:serde"]

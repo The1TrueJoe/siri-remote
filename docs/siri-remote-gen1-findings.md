@@ -19,8 +19,9 @@ as of 2026-09-07 15:15 UTC:
 | Buttons | **working**: Menu, AirPlay, Play/Pause, Volume Up/Down, Siri, Touchpad |
 | Touchpad | **working**: X/Y with pressure, swipes, click + pressed flag |
 | Battery / power state | **working** (percent + charging/plugged-in) |
-| Opus decode + STT | validated offline (29/29 frames; Vosk 0.99x realtime) |
-| Microphone capture | blocked by ATT MTU -- see below |
+| Microphone capture | **working** (2026-10-20): host must start the stream -- see below |
+| Speex decode + STT | 653/653 live A1513 frames decoded; Vosk transcribed correctly |
+| Opus decode (A1962) | validated offline (29/29 frames; Vosk 0.99x realtime) |
 
 The original remote (`DC:2B:2A:D6:38:61`, `C08QR0UNGQQT`) went flat and stopped
 advertising entirely; a second unit proved the whole stack. Everything here is
@@ -41,50 +42,12 @@ BATTERY  27%
 BATTERY  power: plugged in
 ```
 
-### The remaining gap: microphone audio needs Bluetooth 4.2+
+### Microphone audio: the host has to start it
 
-Buttons, touch, and battery all work. Microphone audio does not, and the cause
-is now pinned down precisely.
-
-```
-kernel socket receive MTU: 517
-MTU exchange: asked 104, peer said 23 (raw 03 17 00), using 23
-```
-
-Three separate things were checked, in order:
-
-1. **The L2CAP socket receive MTU** defaults to 23, so the kernel discarded
-   101-byte notifications before userspace saw them. Fixed by setting
-   `BT_RCVMTU` (13) and `BT_SNDMTU` (12) via `setsockopt(SOL_BLUETOOTH, ...)`
-   **before** `connect()`. Confirmed granted: 517. Worth doing regardless --
-   this is very likely part of the "bluez somehow can't handle more than 20
-   bytes" folklore in the published projects.
-2. **Handshake ordering.** The remote answers 23 whether the Exchange MTU is
-   sent before or after the `0xAF` unlock. Not an unlock-state issue.
-3. **The controller is Bluetooth 4.1 and lacks Data Length Extension.**
-
-```
-HCI Version: 4.1 (0x7)   LMP Version: 4.1 (0x7)   Broadcom BCM43438
-LE Features: 1F 00 00 08 00 00 00 00
-             octet 0 = 0b00011111 -> bit 5 (LE Data Packet Length
-             Extension) is CLEAR
-LE Read Suggested Default Data Length -> status 0x01 (Unknown HCI Command)
-```
-
-DLE was introduced in Bluetooth 4.2. The remote grants an ATT MTU of 23 to
-this controller, and at MTU 23 the largest possible notification payload is
-exactly 20 bytes. That is consistent with everything observed: the documented
-payload sizes are 2, 13, 20 and 101 bytes, and we receive **every size that
-fits** and miss only the one that does not.
-
-Audio needs MTU >= 104. **The fix is a Bluetooth 4.2+ (ideally 5.0) USB
-adapter** -- e.g. an RTL8761B-based dongle, which is well supported by the
-mainline Linux `btusb` driver. That also sidesteps the UART entirely, removing
-the frame-reassembly problem described below.
-
-Nothing in the software needs to change for this: the Opus decoding and
-speech-to-text paths are already validated end to end (29/29 frames, Vosk at
-0.99x realtime). Only the transport is short.
+Holding Siri sends nothing but the button report until the host writes
+feature report `0x98` = 1 to the keyhole, i.e. `98 01` to handle `0x001d`.
+Then 82-byte audio notifications follow immediately. The full story, including
+the theories it took to rule out, is under [Voice](#voice).
 
 ## The device does not speak standard HID
 
@@ -140,12 +103,14 @@ first observed:
 
 ## One characteristic carries everything; length disambiguates
 
-| Length | Meaning |
-|--------|---------|
-| 2 bytes | button bitmask only |
-| 13 bytes | one finger on the touchpad |
-| 20 bytes | two fingers |
-| ~101 bytes | **Opus-encoded microphone audio** |
+| Length | First byte | Meaning |
+|--------|------------|---------|
+| 2 bytes | `0x00` | button bitmask only |
+| 2 bytes | `0x10` | end of a voice stream (A1962 only) |
+| 13 bytes | finger count | one finger on the touchpad |
+| 20 bytes | finger count | two fingers |
+| 82 bytes | `0x10` | **Speex microphone frame** (A1513) |
+| 101 bytes | `0x10` | **Opus microphone frame** (A1962) |
 
 **Buttons** -- bitmask in byte 1, so chords work:
 
@@ -172,33 +137,80 @@ Y resolution is noticeably coarser than X.
 
 ## Voice
 
-### Format, derived from the Opus TOC byte
+Measured 2026-10-20 on the A1513 (HID product `0x0266`, firmware
+`100570220007003300`) through a TP-Link UB500 (RTL8761BU, Bluetooth 5.1),
+with `btmon` on the air.
 
-Captured frames begin `[len][0xB8 ...]`. `0xB8` is the Opus TOC:
+### Holding Siri only arms the microphone
+
+With just the `0xAF` unlock, a Siri hold produces exactly two notifications
+-- `00 10` on press, `00 00` on release -- and nothing on the air in between.
+The same is true through BlueZ's `hog` + hidraw path, and on macOS, whose
+driver logs one input report per edge and no audio.
+
+The firmware's audio state machine (from
+[VibeRemote's analysis](https://github.com/mmmmmmarcus/VibeRemote/blob/main/Design/Research/FirstGenerationMicrophoneControl.md)
+of Apple's A1962 firmware) explains why:
+
+| State | Event | Next |
+|-------|-------|------|
+| CONNECTED | Siri down | CONNECTED_WITH_AUDIO (armed, not streaming) |
+| CONNECTED_WITH_AUDIO | feature `0x98` != 0 | STREAMING |
+| STREAMING | Siri up | STREAMING_TIMEOUT (tail, then stop) |
+| STREAMING_TIMEOUT | Siri down | STREAMING again |
+
+An Apple TV sends `0x98` when Siri goes down. Nothing else does. Keyhole writes
+are `[report id, payload...]`, so it is `98 01` to `0x001d` -- the same handle
+and framing as the `AF` unlock, which is itself report `0xAF` with no payload.
+The remote acknowledges with a Write Response and starts streaming within
+~100 ms.
+
+The A1962 measured by
+[open-appleremote](https://github.com/a-funk/open-appleremote) streams
+without it, presumably because its firmware enables the "fast switch" that
+skips this step.
+
+### Frame format: Speex wideband, not Opus
 
 ```
-0xB8 = 10111 0 00
-        |    | +-- c  = 0  -> 1 frame per packet
-        |    +---- s  = 0  -> mono
-        +--------- config 23 -> CELT-only, wideband (16 kHz), 20 ms frames
+[0x10][buttons][70-byte Speex frame][46 00 = len 70][4 bytes][f32 LE stream time]
 ```
 
-So: **Opus, 16 kHz, mono, 20 ms frames (320 samples)**, each packet
-length-prefixed by the byte before the TOC. Confirmed against the reference
-project's WAV output (PCM 16-bit, 1 channel, 16 kHz).
+- The codec frame starts `0x30`..`0x37`: Speex's narrowband-layer header,
+  wideband bit 0 then submode `0110` = 6. Speex wideband at quality 8 is
+  narrowband submode 6 plus a high band, 27.8 kbit/s -- 70 bytes per 20 ms.
+  All 653 captured frames decode with libspeex (`SPEEX_MODEID_WB`, 320 samples
+  each); Vosk transcribed the result correctly. Opus decodes almost none.
+- The trailing float advances by exactly 0.02 per frame (`0x3ca3d70a` = 0.02,
+  `0x3d23d70a` = 0.04, ...), so it doubles as a loss detector.
+- Byte 1 is the live button mask. **While streaming, the remote sends no
+  separate button reports** -- a release shows up only as `10 00` in the
+  frames, and a re-press as `10 10`.
+- There is no end marker on the A1513: after release the stream runs a
+  ~1--1.5 s tail and stops.
 
-### Why nobody had captured voice before
+The A1962's 101-byte layout is different again (`[0x10][buttons][level u16]
+[seq u16][len][Opus, TOC 0xB8][filler]`, per open-appleremote) and ends with a
+2-byte `10 xx`.
 
-Both published implementations note "bluez somehow can't handle more than 20
-bytes" and never tested audio. That is an **ATT MTU** problem: the default is
-23 bytes (20 usable), so 101-byte audio notifications cannot fit. The fix is a
-single Exchange MTU at connect time -- the reference uses exactly `104`
-(101 payload + 3 ATT header). `tools/siri_att.py` negotiates it before
-enabling notifications, which is the ordering that matters.
+### The ATT MTU is irrelevant
 
-The Pi 3's BCM43438 is Bluetooth 4.1 with no Data Length Extension, so a
-101-byte notification is fragmented across L2CAP and reassembled by the
-kernel. That is fine and invisible to us; only the ATT MTU matters.
+The remote answers MTU 23 to every host -- the Pi, macOS -- and never
+initiates an exchange. It sends 85-byte ATT PDUs regardless, split across
+27-byte link-layer fragments, and the kernel reassembles them. What matters is
+the **socket** receive MTU (`BT_RCVMTU`, set before `connect()`), which must
+accept the whole PDU. The earlier conclusions here -- that audio needed a
+Bluetooth 4.2 controller with Data Length Extension, or that the remote
+grants a larger MTU if it asks first -- were both wrong.
+
+### Connection interval
+
+At Linux's default 30--50 ms interval the remote delivers one notification per
+connection event, about every 45 ms, while producing one every 20 ms. It falls
+behind: 7.3 s of speech took 16.6 s to arrive, and the stream kept draining
+long after release. The library asks for 7.5--15 ms with an HCI LE Connection
+Update right after connecting (`crates/siri-remote/src/hci.rs`), which needs
+`CAP_NET_RAW`.
 
 ### Validated without hardware
 
@@ -333,3 +345,11 @@ The `0xAF` handshake, the button bitmask and the touch decoding come from:
 The Opus framing was cross-checked against captured frames from:
 
 - <https://github.com/Jack-R1/SiriRemoteVoiceDecoder>
+
+The `0x98` stream-start report and the audio state machine come from:
+
+- <https://github.com/mmmmmmarcus/VibeRemote>
+
+The A1962's voice layout and the observation that the remote ignores the MTU:
+
+- <https://github.com/a-funk/open-appleremote>

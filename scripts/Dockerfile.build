@@ -2,6 +2,6 @@
 # runs natively, so it is far faster than compiling on the Pi itself.
 FROM rust:slim
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-      libdbus-1-dev libopus-dev pkg-config ca-certificates \
+      libdbus-1-dev libopus-dev libspeex-dev pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /w

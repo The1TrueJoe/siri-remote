@@ -9,6 +9,7 @@
 //! Bonding still comes from BlueZ; the kernel supplies the long-term key when
 //! we ask for an encrypted link.
 
+use std::collections::VecDeque;
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -78,9 +79,15 @@ fn last_os_error() -> io::Error {
 
 pub struct AttSocket {
     fd: OwnedFd,
-    /// Negotiated ATT MTU. Audio needs at least [`protocol::MIN_MTU`].
+    /// Negotiated ATT MTU. The remote ignores it for notifications — audio
+    /// frames arrive larger than this — so it is informational only.
     pub mtu: u16,
+    /// What the kernel will accept per PDU. Audio needs at least
+    /// [`protocol::MIN_MTU`](crate::protocol::MIN_MTU).
     pub kernel_rcv_mtu: u16,
+    /// Notifications that arrived while a request was waiting for its
+    /// response, delivered by [`AttSocket::next_notification`] in order.
+    pending: VecDeque<(u16, Vec<u8>)>,
 }
 
 impl AttSocket {
@@ -239,6 +246,7 @@ impl AttSocket {
                 fd,
                 mtu: DEFAULT_ATT_MTU,
                 kernel_rcv_mtu: granted,
+                pending: VecDeque::new(),
             })
         }
     }
@@ -285,14 +293,20 @@ impl AttSocket {
         Ok(buf)
     }
 
-    /// Send a request and wait for its matching response, skipping any
-    /// notifications that race it.
+    /// Send a request and wait for its matching response. Notifications that
+    /// race it are queued, not dropped: a request sent mid-stream (starting
+    /// the microphone, say) must not cost an audio frame or a button edge.
     fn transact(&mut self, pdu: &[u8], expect: u8) -> Result<Vec<u8>> {
         self.send_pdu(pdu)?;
         loop {
             let rsp = self.recv_pdu(Some(Duration::from_secs(10)))?;
             match rsp[0] {
-                OP_HANDLE_NOTIFY => continue,
+                OP_HANDLE_NOTIFY => {
+                    if rsp.len() >= 3 {
+                        let handle = u16::from_le_bytes([rsp[1], rsp[2]]);
+                        self.pending.push_back((handle, rsp[3..].to_vec()));
+                    }
+                }
                 OP_ERROR_RSP if rsp.len() >= 5 => {
                     let handle = u16::from_le_bytes([rsp[2], rsp[3]]);
                     return Err(Error::Att {
@@ -308,62 +322,11 @@ impl AttSocket {
         }
     }
 
-    /// Wait for the remote to initiate the MTU exchange, and answer it.
-    ///
-    /// ATT MTU with this remote is asymmetric in practice. Asking it yields its
-    /// *Server* RX MTU of 23 — it receives almost nothing, so it declares a
-    /// tiny value. But when the remote initiates, it announces a *Client* RX
-    /// MTU of 104. The connection MTU is the minimum of the two declared
-    /// values, so whoever asks first determines the outcome:
-    ///
-    /// * we ask first  -> min(517, 23)  = 23   -> no microphone audio
-    /// * remote asks   -> min(104, 517) = 104  -> 101-byte frames fit
-    ///
-    /// Losing this race is why the published projects could see audio in a
-    /// packet capture but never receive it.
-    ///
-    /// Returns the negotiated MTU if the remote asked, along with any
-    /// notifications that arrived while waiting so the caller can replay them.
-    pub fn await_peer_mtu(
-        &mut self,
-        wait: Duration,
-        our_mtu: u16,
-    ) -> (Option<u16>, Vec<(u16, Vec<u8>)>) {
-        let deadline = Instant::now() + wait;
-        let mut buffered = Vec::new();
-
-        while Instant::now() < deadline {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let pkt = match self.recv_pdu(Some(left.max(Duration::from_millis(50)))) {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-            if pkt.is_empty() {
-                break;
-            }
-            if pkt[0] == OP_MTU_REQ && pkt.len() >= 3 {
-                let theirs = u16::from_le_bytes([pkt[1], pkt[2]]);
-                let mut rsp = vec![OP_MTU_RSP];
-                rsp.extend_from_slice(&our_mtu.to_le_bytes());
-                if self.send_pdu(&rsp).is_err() {
-                    break;
-                }
-                self.mtu = our_mtu.min(theirs).max(DEFAULT_ATT_MTU);
-                return (Some(self.mtu), buffered);
-            }
-            if pkt[0] == OP_HANDLE_NOTIFY && pkt.len() >= 3 {
-                let handle = u16::from_le_bytes([pkt[1], pkt[2]]);
-                buffered.push((handle, pkt[3..].to_vec()));
-            }
-        }
-        (None, buffered)
-    }
-
     /// Negotiate the ATT MTU.
     ///
-    /// Must succeed for microphone audio: frames are 101 bytes and the default
-    /// 23-byte MTU truncates them. Only one exchange is permitted per
-    /// connection, so the first answer is the one we live with.
+    /// The remote answers 23 to every host — macOS included — and then sends
+    /// larger audio notifications anyway, so the result does not gate audio.
+    /// It is still worth asking: it is what a well-behaved client does.
     pub fn exchange_mtu(&mut self, want: u16) -> Result<u16> {
         let mut pdu = vec![OP_MTU_REQ];
         pdu.extend_from_slice(&want.to_le_bytes());
@@ -388,9 +351,18 @@ impl AttSocket {
         Ok(rsp[1..].to_vec())
     }
 
+    /// Ask for a different connection interval; see [`crate::hci`]. Returns
+    /// the HCI connection handle the request was sent for.
+    pub fn request_conn_params(&self, params: &crate::hci::ConnParams) -> io::Result<u16> {
+        crate::hci::request_conn_params(self.fd.as_raw_fd(), params)
+    }
+
     /// Wait for the next notification, returning `(handle, payload)`.
     /// Non-notification PDUs are skipped.
-    pub fn next_notification(&self, timeout: Option<Duration>) -> Result<(u16, Vec<u8>)> {
+    pub fn next_notification(&mut self, timeout: Option<Duration>) -> Result<(u16, Vec<u8>)> {
+        if let Some(n) = self.pending.pop_front() {
+            return Ok(n);
+        }
         loop {
             let pkt = self.recv_pdu(timeout)?;
             if pkt.len() < 3 || pkt[0] != OP_HANDLE_NOTIFY {

@@ -29,6 +29,9 @@ pub enum Error {
     #[error("opus: {0}")]
     Opus(String),
 
+    #[error("speex: {0}")]
+    Speex(String),
+
     #[error("bluetooth: {0}")]
     Bluez(String),
 }

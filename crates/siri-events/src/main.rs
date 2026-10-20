@@ -17,7 +17,7 @@
 //! and `t` (unix seconds). Diagnostics go to stderr, so stdout stays parseable.
 //!
 //! ```text
-//! {"event":"connected","mtu":104,"audio_available":true}
+//! {"event":"connected","mtu":23,"kernel_rcv_mtu":517,"audio_available":true}
 //! {"event":"button","button":"MENU","state":"down"}
 //! {"event":"button","button":"MENU","state":"up"}
 //! {"event":"swipe","direction":"SWIPE_LEFT"}
@@ -25,7 +25,7 @@
 //! {"event":"battery","percent":27}
 //! {"event":"power","state":"plugged in"}
 //! {"event":"voice_start"}
-//! {"event":"voice_end","frames":52,"seconds":1.04,"wav":"/tmp/voice/….wav"}
+//! {"event":"voice_end","frames":52,"concealed":0,"seconds":1.04,"wav":"/tmp/voice/….wav"}
 //! {"event":"disconnected","reason":"link closed"}
 //! ```
 
@@ -44,9 +44,8 @@ struct Cli {
     /// Adapter to use, by BD address or kernel name (e.g. `hci1`). Defaults to
     /// BlueZ's default adapter.
     ///
-    /// Worth naming on a machine with both a built-in radio and a dongle:
-    /// microphone audio needs a Bluetooth 4.2+ controller, and a Raspberry
-    /// Pi 3's built-in radio is 4.1.
+    /// Worth naming on a machine with more than one radio, so the remote is
+    /// always paired with and connected through the same one.
     #[arg(long, global = true)]
     adapter: Option<String>,
 
@@ -94,6 +93,11 @@ enum Command {
         /// Peer address type, when BlueZ reports the remote as random.
         #[arg(long, default_value = "public")]
         addr_type: String,
+        /// Keep the kernel's default connection interval instead of asking
+        /// for a faster one. Asking needs CAP_NET_RAW; without the faster
+        /// interval the microphone lags further behind the longer you speak.
+        #[arg(long)]
+        keep_interval: bool,
     },
 }
 
@@ -146,7 +150,17 @@ async fn main() -> Result<()> {
             raw_touch,
             timeout,
             addr_type,
-        } => listen(address, audio_dir, pcm_fifo, raw_touch, timeout, addr_type, adapter),
+            keep_interval,
+        } => listen(
+            address,
+            audio_dir,
+            pcm_fifo,
+            raw_touch,
+            timeout,
+            addr_type,
+            adapter,
+            keep_interval,
+        ),
     }
 }
 
@@ -163,7 +177,7 @@ async fn adapters() -> Result<()> {
             a.name, a.address, a.powered, a.discovering
         );
     }
-    eprintln!("\nMicrophone audio needs a Bluetooth 4.2+ adapter; pass --adapter to choose one.");
+    eprintln!("\nPass --adapter to choose one.");
     Ok(())
 }
 
@@ -204,6 +218,7 @@ fn listen(
     timeout: u64,
     addr_type: String,
     adapter: Option<String>,
+    keep_interval: bool,
 ) -> Result<()> {
     if let Some(d) = &audio_dir {
         std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
@@ -231,6 +246,9 @@ fn listen(
         siri_remote::att::BDADDR_LE_PUBLIC
     };
     cfg.adapter = adapter;
+    if keep_interval {
+        cfg.conn_params = None;
+    }
 
     let mut swipes = SwipeDetector::default();
     eprintln!("waiting for {address} — press a button on the remote");
@@ -243,7 +261,7 @@ fn listen(
                 json!({
                     "mtu": mtu,
                     "kernel_rcv_mtu": kernel_rcv_mtu,
-                    "audio_available": mtu >= protocol::MIN_MTU,
+                    "audio_available": kernel_rcv_mtu >= protocol::MIN_MTU,
                 }),
             ),
             Event::AudioUnavailable { mtu, needed } => emit(
@@ -252,8 +270,7 @@ fn listen(
                 json!({
                     "mtu": mtu,
                     "needed": needed,
-                    "reason": "the remote grants a small ATT MTU to controllers \
-                               without Bluetooth 4.2 Data Length Extension",
+                    "reason": "the kernel socket cannot accept whole microphone frames",
                 }),
             ),
             Event::ButtonDown(b) => emit(
@@ -304,12 +321,14 @@ fn listen(
                 pcm,
                 frames,
                 undecodable,
+                concealed,
                 held,
             } => {
                 let seconds = pcm.len() as f32 / protocol::AUDIO_SAMPLE_RATE as f32;
                 let mut extra = json!({
                     "frames": frames,
                     "undecodable": undecodable,
+                    "concealed": concealed,
                     "seconds": seconds,
                     "held_ms": held.as_millis() as u64,
                     "sample_rate": protocol::AUDIO_SAMPLE_RATE,

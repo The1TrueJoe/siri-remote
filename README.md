@@ -14,7 +14,7 @@ the protocol was worked out.
 
 | Crate / path | What it is |
 |---|---|
-| `crates/siri-remote` | **The library.** Protocol, transport, gestures, Opus audio. Produces events; decides nothing. |
+| `crates/siri-remote` | **The library.** Protocol, transport, gestures, Speex/Opus audio. Produces events; decides nothing. |
 | `crates/siri-events` | **The seam.** Streams events as newline-delimited JSON so glue can be written in any language. |
 | `examples/` | Glue scripts — Python for live audio, shell for MQTT. |
 | `tools/` | The Python probes the protocol was reverse-engineered with. |
@@ -30,7 +30,7 @@ audio and gets out of the way.
 ## Quick start
 
 ```bash
-sudo apt install build-essential pkg-config libdbus-1-dev libopus-dev
+sudo apt install build-essential pkg-config libdbus-1-dev libopus-dev libspeex-dev
 cargo install --git https://github.com/The1TrueJoe/siri-remote siri-events
 
 siri-events scan                                 # press a button while it runs
@@ -68,17 +68,28 @@ siri-events listen <addr> --pcm-fifo /tmp/siri.pcm &
 examples/python/voice_stream.py /tmp/siri.pcm
 ```
 
-**Status: being reworked.** On the A1513 (HID product `0x0266`) holding Siri
-only arms the microphone; the remote streams once the host writes `98 01` to
-handle `0x001d`, and its frames are Speex wideband rather than Opus. The
-library does not do either yet. `tools/att_probe.py --stream-on-siri`
-demonstrates the working sequence.
+Three things make it work, all handled by the library:
+
+- **The host starts the stream.** Holding Siri only arms the microphone. The
+  session writes feature report `0x98` = 1 (`98 01` to handle `0x001d`) the
+  moment Siri goes down — what an Apple TV does — and the remote then streams
+  until shortly after release.
+- **The codec depends on the model.** The A1513 sends Speex wideband, the
+  A1962 Opus; both are 20 ms frames at 16 kHz and are told apart by layout.
+  Lost frames are concealed by the decoder, so the audio keeps real time.
+- **The link must be fast enough.** At Linux's default 30–50 ms connection
+  interval the remote falls behind its own microphone. The session asks for
+  7.5–15 ms, which needs `CAP_NET_RAW` (run as root or with the capability);
+  `--keep-interval` opts out.
+
+The ATT MTU does not matter: the remote negotiates 23 with every host and
+sends whole frames anyway. Any adapter that can hold the link works.
 
 ## Using the library
 
 ```toml
 [dependencies]
-siri-remote = { git = "https://github.com/The1TrueJoe/siri-remote", tag = "v0.1.0" }
+siri-remote = { git = "https://github.com/The1TrueJoe/siri-remote", tag = "v0.2.0" }
 ```
 
 ```rust
@@ -96,14 +107,15 @@ Session::run(&SessionConfig::new("DC:2B:2A:E0:18:71"), |event| {
 cargo run -p siri-remote --example print_events -- DC:2B:2A:E0:18:71
 ```
 
-Features: `opus` (microphone decoding, on by default) and `bluez` (discovery
-and pairing, off by default — the rest of the crate is synchronous and has no
-D-Bus dependency).
+Features: `speex` and `opus` (microphone decoding for the A1513 and A1962,
+both on by default) and `bluez` (discovery and pairing, off by default — the
+rest of the crate is synchronous and has no D-Bus dependency).
 
 ## Building
 
 Plain `cargo build --release`. The only wrinkle is that the crates link C
-libraries — `libopus` for microphone decoding and `libdbus` for pairing — which
+libraries — `libspeex` and `libopus` for microphone decoding and `libdbus` for
+pairing — which
 makes cross-compilation awkward, since it needs those libraries for the target
 architecture rather than the host.
 
@@ -111,7 +123,7 @@ architecture rather than the host.
 target. A Pi 3 wants `-j2` so the linker does not exhaust memory.
 
 ```bash
-sudo apt install build-essential pkg-config libdbus-1-dev libopus-dev
+sudo apt install build-essential pkg-config libdbus-1-dev libopus-dev libspeex-dev
 cargo build --release -j2
 ```
 
@@ -129,14 +141,14 @@ above. The `bluez` feature and `siri-events` are Linux-only, so check the
 library on its own:
 
 ```bash
-brew install opus
-export LIBRARY_PATH="$(brew --prefix opus)/lib:$LIBRARY_PATH"
+brew install opus speex
+export LIBRARY_PATH="$(brew --prefix opus)/lib:$(brew --prefix speex)/lib:$LIBRARY_PATH"
 cargo test -p siri-remote
 ```
 
 Note that the raw ATT transport describes Linux kernel structures, so it only
 *runs* on Linux — but it type-checks and its unit tests (protocol decoding,
-gestures, Opus, sockaddr layout) pass anywhere.
+gestures, Speex and Opus decoding, sockaddr layout) pass anywhere.
 
 ## Credits
 
@@ -146,4 +158,6 @@ The `0xAF` unlock byte, the button bitmask and the touch decoding come from
 Opus framing was cross-checked against captures from
 [Jack-R1/SiriRemoteVoiceDecoder](https://github.com/Jack-R1/SiriRemoteVoiceDecoder).
 The `0x98` stream-start report comes from the firmware analysis in
-[mmmmmmarcus/VibeRemote](https://github.com/mmmmmmarcus/VibeRemote).
+[mmmmmmarcus/VibeRemote](https://github.com/mmmmmmarcus/VibeRemote), and the
+A1962 voice layout from
+[a-funk/open-appleremote](https://github.com/a-funk/open-appleremote).

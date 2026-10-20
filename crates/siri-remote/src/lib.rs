@@ -33,28 +33,30 @@
 //!
 //! # Audio
 //!
-//! The microphone stream is Opus at 16 kHz mono in 20 ms frames, decoded here
-//! to raw PCM. [`Event::VoiceAudio`] delivers each 20 ms chunk as it arrives
-//! for live consumers; [`Event::VoiceEnd`] delivers the whole utterance.
-//! [`audio::wav_bytes`] wraps PCM as a WAV file.
+//! The microphone streams 16 kHz mono in 20 ms frames — Speex on the A1513,
+//! Opus on the A1962 — decoded here to raw PCM. [`Event::VoiceAudio`] delivers
+//! each 20 ms chunk as it arrives for live consumers; [`Event::VoiceEnd`]
+//! delivers the whole utterance. [`audio::wav_bytes`] wraps PCM as a WAV file.
 //!
-//! Audio requires an ATT MTU of at least [`protocol::MIN_MTU`], which in
-//! practice means a Bluetooth 4.2+ controller — the remote will not grant a
-//! large MTU to a 4.1 adapter with no Data Length Extension. When the MTU is
-//! too small you get [`Event::AudioUnavailable`] and everything else still
-//! works.
+//! Holding Siri only arms the microphone: the session starts the stream by
+//! writing [`protocol::STREAM_START`] the moment Siri goes down, and asks for
+//! a short connection interval so frames arrive as fast as they are produced.
+//! Lost frames are concealed rather than skipped, so the audio keeps its
+//! timing.
 
 pub mod att;
-#[cfg(feature = "opus")]
+#[cfg(any(feature = "opus", feature = "speex"))]
 pub mod audio;
 #[cfg(feature = "bluez")]
 pub mod bluez;
 pub mod error;
 pub mod gesture;
+pub mod hci;
 pub mod protocol;
 pub mod session;
 
 pub use error::{Error, Result};
 pub use gesture::{Swipe, SwipeDetector};
-pub use protocol::{Button, Buttons, Finger, Report};
+pub use hci::ConnParams;
+pub use protocol::{AudioFrame, Button, Buttons, Codec, Finger, Report};
 pub use session::{Event, PowerState, Session, SessionConfig};

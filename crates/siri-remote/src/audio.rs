@@ -1,18 +1,33 @@
-//! Opus decoding for the remote's microphone stream.
+//! Decoding for the remote's microphone stream.
 //!
-//! The remote emits Opus at 16 kHz mono in 20 ms frames — TOC byte `0xB8` is
-//! config 23 (CELT, wideband), mono, one frame per packet. That is exactly the
-//! format speech recognisers such as Vosk expect, so nothing needs resampling.
+//! Both hardware revisions send 16 kHz mono in 20 ms frames — exactly the
+//! format speech recognisers such as Vosk expect, so nothing needs
+//! resampling — but in different codecs:
 //!
-//! libopus is called through a small `extern "C"` block rather than a wrapper
-//! crate: the C API is tiny and stable, and this keeps the dependency tree and
-//! build requirements down to `libopus0`.
+//! * **A1513** (HID product `0x0266`): Speex wideband. [`SpeexDecoder`],
+//!   feature `speex`, links `libspeex`.
+//! * **A1962** (HID product `0x026D`): Opus, TOC byte `0xB8` = config 23
+//!   (CELT, wideband), mono, one frame per packet. [`OpusDecoder`], feature
+//!   `opus`, links `libopus`.
+//!
+//! Both libraries are called through small `extern "C"` blocks rather than
+//! wrapper crates: the C APIs are tiny and stable, and this keeps the
+//! dependency tree and build requirements down to the system libraries.
 
+#[cfg(feature = "opus")]
+pub use opus::OpusDecoder;
+#[cfg(feature = "speex")]
+pub use speex::SpeexDecoder;
+
+#[cfg(feature = "opus")]
+mod opus {
 use crate::error::{Error, Result};
 use std::os::raw::{c_char, c_int, c_void};
 
 /// 120 ms at 48 kHz — the maximum any Opus packet can decode to.
 const MAX_FRAME_SAMPLES: usize = 5760;
+/// One 20 ms frame at 16 kHz, the length concealment fills in.
+const FRAME_SAMPLES: usize = 320;
 
 #[link(name = "opus")]
 extern "C" {
@@ -79,6 +94,24 @@ impl OpusDecoder {
         }
         Ok(self.buf[..n as usize * self.channels].to_vec())
     }
+
+    /// Synthesise one frame in place of a lost one (packet loss concealment).
+    pub fn conceal(&mut self) -> Result<Vec<i16>> {
+        let n = unsafe {
+            opus_decode(
+                self.st,
+                std::ptr::null(),
+                0,
+                self.buf.as_mut_ptr(),
+                FRAME_SAMPLES as c_int,
+                0,
+            )
+        };
+        if n < 0 {
+            return Err(Error::Opus(strerror(n)));
+        }
+        Ok(self.buf[..n as usize * self.channels].to_vec())
+    }
 }
 
 impl Drop for OpusDecoder {
@@ -88,6 +121,119 @@ impl Drop for OpusDecoder {
             self.st = std::ptr::null_mut();
         }
     }
+}
+}
+
+#[cfg(feature = "speex")]
+mod speex {
+use crate::error::{Error, Result};
+use std::os::raw::{c_char, c_int, c_void};
+
+const SPEEX_MODEID_WB: c_int = 1;
+const SPEEX_SET_ENH: c_int = 0;
+const SPEEX_GET_FRAME_SIZE: c_int = 3;
+
+/// `struct SpeexBits` from `speex/speex_bits.h`.
+#[repr(C)]
+struct SpeexBits {
+    chars: *mut c_char,
+    nb_bits: c_int,
+    char_ptr: c_int,
+    bit_ptr: c_int,
+    owner: c_int,
+    overflow: c_int,
+    buf_size: c_int,
+    reserved1: c_int,
+    reserved2: *mut c_void,
+}
+
+#[link(name = "speex")]
+extern "C" {
+    fn speex_lib_get_mode(mode: c_int) -> *const c_void;
+    fn speex_decoder_init(mode: *const c_void) -> *mut c_void;
+    fn speex_decoder_destroy(st: *mut c_void);
+    fn speex_decoder_ctl(st: *mut c_void, request: c_int, ptr: *mut c_void) -> c_int;
+    fn speex_decode_int(st: *mut c_void, bits: *mut SpeexBits, out: *mut i16) -> c_int;
+    fn speex_bits_init(bits: *mut SpeexBits);
+    fn speex_bits_destroy(bits: *mut SpeexBits);
+    fn speex_bits_read_from(bits: *mut SpeexBits, bytes: *const c_char, len: c_int);
+}
+
+/// Speex wideband (16 kHz) decoder for the A1513's microphone frames.
+pub struct SpeexDecoder {
+    st: *mut c_void,
+    // Boxed so its address stays put: libspeex keeps pointers into it.
+    bits: Box<SpeexBits>,
+    frame_size: usize,
+    buf: Vec<i16>,
+}
+
+// The decoder is owned exclusively and libspeex keeps no global state.
+unsafe impl Send for SpeexDecoder {}
+
+impl SpeexDecoder {
+    pub fn new() -> Result<Self> {
+        unsafe {
+            let mode = speex_lib_get_mode(SPEEX_MODEID_WB);
+            if mode.is_null() {
+                return Err(Error::Speex("wideband mode unavailable".into()));
+            }
+            let st = speex_decoder_init(mode);
+            if st.is_null() {
+                return Err(Error::Speex("decoder init failed".into()));
+            }
+            // Perceptual enhancement: a postfilter that noticeably cleans up
+            // speech at this bitrate.
+            let mut on: c_int = 1;
+            speex_decoder_ctl(st, SPEEX_SET_ENH, &mut on as *mut c_int as *mut c_void);
+            let mut fs: c_int = 0;
+            speex_decoder_ctl(st, SPEEX_GET_FRAME_SIZE, &mut fs as *mut c_int as *mut c_void);
+
+            let mut bits = Box::new(std::mem::zeroed::<SpeexBits>());
+            speex_bits_init(&mut *bits);
+            Ok(SpeexDecoder {
+                st,
+                bits,
+                frame_size: fs.max(1) as usize,
+                buf: vec![0i16; fs.max(1) as usize],
+            })
+        }
+    }
+
+    /// Decode one Speex frame into 16-bit PCM samples.
+    pub fn decode(&mut self, frame: &[u8]) -> Result<Vec<i16>> {
+        let rc = unsafe {
+            speex_bits_read_from(&mut *self.bits, frame.as_ptr() as *const c_char, frame.len() as c_int);
+            speex_decode_int(self.st, &mut *self.bits, self.buf.as_mut_ptr())
+        };
+        match rc {
+            0 => Ok(self.buf[..self.frame_size].to_vec()),
+            -1 => Err(Error::Speex("end of stream".into())),
+            _ => Err(Error::Speex("corrupt frame".into())),
+        }
+    }
+
+    /// Synthesise one frame in place of a lost one (packet loss concealment).
+    pub fn conceal(&mut self) -> Result<Vec<i16>> {
+        let rc = unsafe { speex_decode_int(self.st, std::ptr::null_mut(), self.buf.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(Error::Speex("concealment failed".into()));
+        }
+        Ok(self.buf[..self.frame_size].to_vec())
+    }
+}
+
+impl Drop for SpeexDecoder {
+    fn drop(&mut self) {
+        unsafe {
+            speex_bits_destroy(&mut *self.bits);
+            if !self.st.is_null() {
+                speex_decoder_destroy(self.st);
+                self.st = std::ptr::null_mut();
+            }
+        }
+    }
+}
 }
 
 /// Serialise PCM as a RIFF/WAVE file.
@@ -115,6 +261,7 @@ pub fn wav_bytes(pcm: &[i16], sample_rate: u32, channels: u8) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
@@ -129,6 +276,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes([w[40], w[41], w[42], w[43]]), 320);
     }
 
+    #[cfg(feature = "opus")]
     #[test]
     fn decoder_round_trips_a_real_frame() {
         // A genuine 16 kHz mono frame captured from a Siri Remote: TOC 0xB8.
@@ -146,5 +294,18 @@ mod tests {
         // 20 ms at 16 kHz
         assert_eq!(pcm.len(), 320);
         assert!(pcm.iter().any(|&s| s != 0), "decoded frame is silent");
+    }
+
+    #[cfg(feature = "speex")]
+    #[test]
+    fn speex_decodes_a_real_a1513_frame() {
+        use crate::protocol::extract_speex;
+        use crate::protocol::test_frames::{unhex, SPEEX_NOTIFICATION};
+        let (frame, _) = extract_speex(&unhex(SPEEX_NOTIFICATION)).expect("speex frame");
+        let mut d = SpeexDecoder::new().expect("decoder");
+        let pcm = d.decode(&frame).expect("decode");
+        assert_eq!(pcm.len(), 320, "20 ms at 16 kHz");
+        let concealed = d.conceal().expect("conceal");
+        assert_eq!(concealed.len(), 320);
     }
 }

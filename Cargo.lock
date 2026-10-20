@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "siri-events"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "siri-remote"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bluer",
  "futures-util",

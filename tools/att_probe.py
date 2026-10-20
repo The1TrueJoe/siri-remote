@@ -135,7 +135,7 @@ def main():
                 e = get_errno()
                 if e not in (errno.EINPROGRESS, errno.EALREADY):
                     raise OSError(e, os.strerror(e))
-                _, w, _ = select.select([], [s], [], min(45, deadline - time.time()))
+                _, w, _ = select.select([], [s], [], max(0, min(45, deadline - time.time())))
                 if not w:
                     raise OSError(errno.ETIMEDOUT, "still pending")
                 err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)

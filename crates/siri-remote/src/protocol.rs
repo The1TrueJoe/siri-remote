@@ -2,19 +2,29 @@
 //!
 //! Everything the remote sends arrives as notifications on a single
 //! characteristic (value handle [`H_INPUT`]) and is told apart by payload
-//! length:
+//! length and first byte:
 //!
-//! | Length | Meaning |
-//! |--------|---------|
-//! | 2      | button bitmask only |
-//! | 13     | one finger on the touchpad |
-//! | 20     | two fingers |
-//! | ~101   | Opus-encoded microphone audio |
+//! | Length | First byte | Meaning |
+//! |--------|------------|---------|
+//! | 2      | `0x00`     | button bitmask only |
+//! | 2      | `0x10`     | end of a microphone stream (A1962) |
+//! | 13     | finger count | one finger on the touchpad |
+//! | 20     | finger count | two fingers |
+//! | 82     | `0x10`     | microphone frame, Speex (A1513) — see [`extract_speex`] |
+//! | 101    | `0x10`     | microphone frame, Opus (A1962) — see [`extract_opus`] |
+//!
+//! Byte 1 is always the button bitmask, so a press or release made while the
+//! microphone is streaming is visible in the audio frames themselves — the
+//! remote sends no separate button reports until the stream ends.
 //!
 //! This module is pure logic so it can be unit tested without hardware.
 
 /// Write [`ENABLE_BYTE`] here to unlock the input stream. Until this happens
 /// the remote reports nothing but zeros.
+///
+/// This is a "keyhole": each write is `[report id, payload...]` addressed to
+/// one of the remote's internal feature reports. [`STREAM_START`] goes here
+/// too.
 pub const H_ENABLE: u16 = 0x001D;
 /// Buttons, touch and audio all arrive here.
 pub const H_INPUT: u16 = 0x0023;
@@ -30,14 +40,36 @@ pub const H_VENDOR_CCCD: u16 = 0x003B;
 /// The vendor handshake byte.
 pub const ENABLE_BYTE: u8 = 0xAF;
 
-/// Microphone frames are 101 bytes, so the ATT MTU must be at least this
-/// (101 payload + 3 bytes of ATT header) or audio cannot arrive at all.
+/// Feature report `0x98` = 1, written to [`H_ENABLE`]: start streaming the
+/// microphone.
+///
+/// Holding Siri only *arms* the microphone. In the firmware's audio state
+/// machine, Siri down moves CONNECTED to CONNECTED_WITH_AUDIO, and only this
+/// report moves it on to STREAMING — which is what an Apple TV sends. Without
+/// it the remote reports the button and stays silent. Releasing Siri ends the
+/// stream on its own after a short tail, so no stop command is needed.
+pub const STREAM_START: [u8; 2] = [0x98, 0x01];
+/// Feature report `0x98` = 0: stop streaming immediately, dropping the tail.
+pub const STREAM_STOP: [u8; 2] = [0x98, 0x00];
+
+/// First byte of every microphone notification.
+pub const AUDIO_MARKER: u8 = 0x10;
+
+/// The largest microphone notification is 101 bytes, so the kernel socket
+/// must accept PDUs of at least this size (101 payload + 3 bytes of ATT
+/// header). This is the *kernel receive MTU*: the remote ignores the ATT MTU
+/// it negotiates — it answers 23 to every host — and sends whole frames
+/// regardless.
 pub const MIN_MTU: u16 = 104;
 
 pub const AUDIO_SAMPLE_RATE: u32 = 16_000;
 pub const AUDIO_CHANNELS: u8 = 1;
+/// Every microphone frame is 20 ms, whichever codec carries it.
+pub const AUDIO_FRAME_SECONDS: f32 = 0.020;
 /// Opus TOC 0xB8 = config 23 (CELT, wideband 16 kHz, 20 ms), mono, 1 frame.
 pub const OPUS_TOC_CONFIG: u8 = 23;
+/// A Speex frame is followed by `[len u16][4 bytes][stream time f32]`.
+pub const SPEEX_TRAILER_LEN: usize = 10;
 
 pub const POWER_CHARGING: u8 = 0xAB;
 pub const POWER_DISCHARGING: u8 = 0xAF;
@@ -151,13 +183,38 @@ pub enum Report {
         fingers: Vec<Finger>,
         pressed: bool,
     },
-    /// A microphone frame. `opus` is the extracted Opus packet, if one was
-    /// found in the payload.
+    /// A microphone frame. `frame` is `None` when the payload is recognisably
+    /// audio but in neither known layout.
     Audio {
-        opus: Option<Vec<u8>>,
+        buttons: Buttons,
+        frame: Option<AudioFrame>,
         raw_len: usize,
     },
+    /// The microphone stream has ended (A1962; the A1513 just stops sending).
+    AudioEnd(Buttons),
     Unknown(usize),
+}
+
+/// How a microphone frame is encoded. It differs between hardware revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    /// Speex wideband, 16 kHz, 320 samples per frame. The A1513 (HID product
+    /// `0x0266`).
+    Speex,
+    /// Opus CELT wideband, 16 kHz, 320 samples per frame. The A1962 (HID
+    /// product `0x026D`).
+    Opus,
+}
+
+/// One 20 ms microphone frame, still encoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioFrame {
+    pub codec: Codec,
+    pub payload: Vec<u8>,
+    /// Position in the stream, in seconds, for formats that carry one. It
+    /// advances by [`AUDIO_FRAME_SECONDS`] per frame, so a larger step means
+    /// frames were lost on the way.
+    pub time: Option<f32>,
 }
 
 /// Decode one 7-byte finger record.
@@ -197,16 +254,64 @@ pub fn extract_opus(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     None
 }
 
+/// Extract the Speex frame from an A1513 microphone notification.
+///
+/// The layout is `[0x10][buttons][frame...][len u16 LE][4 bytes][time f32 LE]`.
+/// The length field must account for exactly the bytes between the header and
+/// the trailer, which no Opus frame or touch report satisfies by accident.
+/// The 4 bytes before the timestamp vary with loudness; their meaning is not
+/// known.
+pub fn extract_speex(data: &[u8]) -> Option<(Vec<u8>, f32)> {
+    let n = data.len();
+    if n < 2 + 1 + SPEEX_TRAILER_LEN || data[0] != AUDIO_MARKER {
+        return None;
+    }
+    let t = n - SPEEX_TRAILER_LEN;
+    let len = u16::from_le_bytes([data[t], data[t + 1]]) as usize;
+    if len == 0 || 2 + len != t {
+        return None;
+    }
+    let time = f32::from_le_bytes([data[n - 4], data[n - 3], data[n - 2], data[n - 1]]);
+    if !time.is_finite() || time < 0.0 {
+        return None;
+    }
+    Some((data[2..t].to_vec(), time))
+}
+
 /// Parse one notification payload from [`H_INPUT`].
 pub fn parse(data: &[u8]) -> Report {
     let n = data.len();
 
     if n >= 40 {
-        let opus = extract_opus(data).map(|(p, _)| p);
-        return Report::Audio { opus, raw_len: n };
+        let buttons = if data[0] == AUDIO_MARKER {
+            Buttons(data[1])
+        } else {
+            Buttons::default()
+        };
+        let frame = if let Some((payload, time)) = extract_speex(data) {
+            Some(AudioFrame {
+                codec: Codec::Speex,
+                payload,
+                time: Some(time),
+            })
+        } else {
+            extract_opus(data).map(|(payload, _)| AudioFrame {
+                codec: Codec::Opus,
+                payload,
+                time: None,
+            })
+        };
+        return Report::Audio {
+            buttons,
+            frame,
+            raw_len: n,
+        };
     }
     if n < 2 {
         return Report::Unknown(n);
+    }
+    if n == 2 && data[0] == AUDIO_MARKER {
+        return Report::AudioEnd(Buttons(data[1]));
     }
 
     let mut mask = data[1];
@@ -236,8 +341,25 @@ pub fn parse(data: &[u8]) -> Report {
 }
 
 #[cfg(test)]
+pub(crate) mod test_frames {
+    /// A real A1513 microphone notification (82 bytes, Siri held).
+    pub const SPEEX_NOTIFICATION: &str = "1010377088766f000068e8e8e8e8e8e8e8800034747474747474744480\
+        1a3a3d7fcf481606815f7d1b46b6b71715964b3865ababababab5ababababab29434507\
+        5d82abababab6474600854bc2090ad7a33c";
+
+    pub fn unhex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use super::test_frames::{unhex, SPEEX_NOTIFICATION};
 
     fn buttons_of(data: &[u8]) -> Vec<Button> {
         match parse(data) {
@@ -323,9 +445,57 @@ mod tests {
         let mut pkt = vec![0x00, 0x00, 0x00, 86];
         pkt.extend_from_slice(&opus);
         match parse(&pkt) {
-            Report::Audio { opus: Some(p), .. } => assert_eq!(p, opus),
+            Report::Audio {
+                frame: Some(AudioFrame { codec: Codec::Opus, payload, .. }),
+                ..
+            } => assert_eq!(payload, opus),
             other => panic!("expected audio, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn finds_speex_frame_in_a1513_notification() {
+        let data = unhex(SPEEX_NOTIFICATION);
+        assert_eq!(data.len(), 82);
+        match parse(&data) {
+            Report::Audio {
+                buttons,
+                frame: Some(AudioFrame { codec: Codec::Speex, payload, time }),
+                ..
+            } => {
+                assert!(buttons.contains(Button::Siri));
+                assert_eq!(payload.len(), 70);
+                // Speex narrowband layer header: wideband bit 0, submode 6.
+                assert_eq!(payload[0] >> 3, 0b00110);
+                assert!((time.unwrap() - 0.02).abs() < 1e-6);
+            }
+            other => panic!("expected a Speex frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_during_stream_is_visible_in_audio_frames() {
+        let mut data = unhex(SPEEX_NOTIFICATION);
+        data[1] = 0x00;
+        match parse(&data) {
+            Report::Audio { buttons, frame: Some(_), .. } => {
+                assert!(!buttons.contains(Button::Siri))
+            }
+            other => panic!("expected audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speex_length_must_match_layout() {
+        let mut data = unhex(SPEEX_NOTIFICATION);
+        data[72] = 69; // claim one byte fewer than is there
+        assert!(extract_speex(&data).is_none());
+    }
+
+    #[test]
+    fn two_byte_audio_marker_ends_the_stream() {
+        assert_eq!(parse(&[0x10, 0x00]), Report::AudioEnd(Buttons(0)));
+        assert_eq!(parse(&[0x00, 0x10]), Report::Buttons(Buttons(0x10)));
     }
 
     #[test]
