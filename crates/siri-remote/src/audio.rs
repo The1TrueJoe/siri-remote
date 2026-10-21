@@ -21,219 +21,229 @@ pub use speex::SpeexDecoder;
 
 #[cfg(feature = "opus")]
 mod opus {
-use crate::error::{Error, Result};
-use std::os::raw::{c_char, c_int, c_void};
+    use crate::error::{Error, Result};
+    use std::os::raw::{c_char, c_int, c_void};
 
-/// 120 ms at 48 kHz — the maximum any Opus packet can decode to.
-const MAX_FRAME_SAMPLES: usize = 5760;
-/// One 20 ms frame at 16 kHz, the length concealment fills in.
-const FRAME_SAMPLES: usize = 320;
+    /// 120 ms at 48 kHz — the maximum any Opus packet can decode to.
+    const MAX_FRAME_SAMPLES: usize = 5760;
+    /// One 20 ms frame at 16 kHz, the length concealment fills in.
+    const FRAME_SAMPLES: usize = 320;
 
-#[link(name = "opus")]
-extern "C" {
-    fn opus_decoder_create(fs: i32, channels: c_int, error: *mut c_int) -> *mut c_void;
-    fn opus_decoder_destroy(st: *mut c_void);
-    fn opus_decode(
-        st: *mut c_void,
-        data: *const u8,
-        len: i32,
-        pcm: *mut i16,
-        frame_size: c_int,
-        decode_fec: c_int,
-    ) -> c_int;
-    fn opus_strerror(error: c_int) -> *const c_char;
-}
-
-fn strerror(code: c_int) -> String {
-    unsafe {
-        let p = opus_strerror(code);
-        if p.is_null() {
-            return format!("opus error {code}");
-        }
-        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-    }
-}
-
-pub struct OpusDecoder {
-    st: *mut c_void,
-    channels: usize,
-    buf: Vec<i16>,
-}
-
-// The decoder is owned exclusively and libopus keeps no global state.
-unsafe impl Send for OpusDecoder {}
-
-impl OpusDecoder {
-    pub fn new(sample_rate: u32, channels: u8) -> Result<Self> {
-        let mut err: c_int = 0;
-        let st = unsafe { opus_decoder_create(sample_rate as i32, channels as c_int, &mut err) };
-        if st.is_null() || err != 0 {
-            return Err(Error::Opus(strerror(err)));
-        }
-        Ok(OpusDecoder {
-            st,
-            channels: channels as usize,
-            buf: vec![0i16; MAX_FRAME_SAMPLES * channels as usize],
-        })
+    #[link(name = "opus")]
+    extern "C" {
+        fn opus_decoder_create(fs: i32, channels: c_int, error: *mut c_int) -> *mut c_void;
+        fn opus_decoder_destroy(st: *mut c_void);
+        fn opus_decode(
+            st: *mut c_void,
+            data: *const u8,
+            len: i32,
+            pcm: *mut i16,
+            frame_size: c_int,
+            decode_fec: c_int,
+        ) -> c_int;
+        fn opus_strerror(error: c_int) -> *const c_char;
     }
 
-    /// Decode one Opus packet into 16-bit PCM samples.
-    pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>> {
-        let n = unsafe {
-            opus_decode(
-                self.st,
-                packet.as_ptr(),
-                packet.len() as i32,
-                self.buf.as_mut_ptr(),
-                MAX_FRAME_SAMPLES as c_int,
-                0,
-            )
-        };
-        if n < 0 {
-            return Err(Error::Opus(strerror(n)));
-        }
-        Ok(self.buf[..n as usize * self.channels].to_vec())
-    }
-
-    /// Synthesise one frame in place of a lost one (packet loss concealment).
-    pub fn conceal(&mut self) -> Result<Vec<i16>> {
-        let n = unsafe {
-            opus_decode(
-                self.st,
-                std::ptr::null(),
-                0,
-                self.buf.as_mut_ptr(),
-                FRAME_SAMPLES as c_int,
-                0,
-            )
-        };
-        if n < 0 {
-            return Err(Error::Opus(strerror(n)));
-        }
-        Ok(self.buf[..n as usize * self.channels].to_vec())
-    }
-}
-
-impl Drop for OpusDecoder {
-    fn drop(&mut self) {
-        if !self.st.is_null() {
-            unsafe { opus_decoder_destroy(self.st) };
-            self.st = std::ptr::null_mut();
-        }
-    }
-}
-}
-
-#[cfg(feature = "speex")]
-mod speex {
-use crate::error::{Error, Result};
-use std::os::raw::{c_char, c_int, c_void};
-
-const SPEEX_MODEID_WB: c_int = 1;
-const SPEEX_SET_ENH: c_int = 0;
-const SPEEX_GET_FRAME_SIZE: c_int = 3;
-
-/// `struct SpeexBits` from `speex/speex_bits.h`.
-#[repr(C)]
-struct SpeexBits {
-    chars: *mut c_char,
-    nb_bits: c_int,
-    char_ptr: c_int,
-    bit_ptr: c_int,
-    owner: c_int,
-    overflow: c_int,
-    buf_size: c_int,
-    reserved1: c_int,
-    reserved2: *mut c_void,
-}
-
-#[link(name = "speex")]
-extern "C" {
-    fn speex_lib_get_mode(mode: c_int) -> *const c_void;
-    fn speex_decoder_init(mode: *const c_void) -> *mut c_void;
-    fn speex_decoder_destroy(st: *mut c_void);
-    fn speex_decoder_ctl(st: *mut c_void, request: c_int, ptr: *mut c_void) -> c_int;
-    fn speex_decode_int(st: *mut c_void, bits: *mut SpeexBits, out: *mut i16) -> c_int;
-    fn speex_bits_init(bits: *mut SpeexBits);
-    fn speex_bits_destroy(bits: *mut SpeexBits);
-    fn speex_bits_read_from(bits: *mut SpeexBits, bytes: *const c_char, len: c_int);
-}
-
-/// Speex wideband (16 kHz) decoder for the A1513's microphone frames.
-pub struct SpeexDecoder {
-    st: *mut c_void,
-    // Boxed so its address stays put: libspeex keeps pointers into it.
-    bits: Box<SpeexBits>,
-    frame_size: usize,
-    buf: Vec<i16>,
-}
-
-// The decoder is owned exclusively and libspeex keeps no global state.
-unsafe impl Send for SpeexDecoder {}
-
-impl SpeexDecoder {
-    pub fn new() -> Result<Self> {
+    fn strerror(code: c_int) -> String {
         unsafe {
-            let mode = speex_lib_get_mode(SPEEX_MODEID_WB);
-            if mode.is_null() {
-                return Err(Error::Speex("wideband mode unavailable".into()));
+            let p = opus_strerror(code);
+            if p.is_null() {
+                return format!("opus error {code}");
             }
-            let st = speex_decoder_init(mode);
-            if st.is_null() {
-                return Err(Error::Speex("decoder init failed".into()));
-            }
-            // Perceptual enhancement: a postfilter that noticeably cleans up
-            // speech at this bitrate.
-            let mut on: c_int = 1;
-            speex_decoder_ctl(st, SPEEX_SET_ENH, &mut on as *mut c_int as *mut c_void);
-            let mut fs: c_int = 0;
-            speex_decoder_ctl(st, SPEEX_GET_FRAME_SIZE, &mut fs as *mut c_int as *mut c_void);
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
 
-            let mut bits = Box::new(std::mem::zeroed::<SpeexBits>());
-            speex_bits_init(&mut *bits);
-            Ok(SpeexDecoder {
+    pub struct OpusDecoder {
+        st: *mut c_void,
+        channels: usize,
+        buf: Vec<i16>,
+    }
+
+    // The decoder is owned exclusively and libopus keeps no global state.
+    unsafe impl Send for OpusDecoder {}
+
+    impl OpusDecoder {
+        pub fn new(sample_rate: u32, channels: u8) -> Result<Self> {
+            let mut err: c_int = 0;
+            let st =
+                unsafe { opus_decoder_create(sample_rate as i32, channels as c_int, &mut err) };
+            if st.is_null() || err != 0 {
+                return Err(Error::Opus(strerror(err)));
+            }
+            Ok(OpusDecoder {
                 st,
-                bits,
-                frame_size: fs.max(1) as usize,
-                buf: vec![0i16; fs.max(1) as usize],
+                channels: channels as usize,
+                buf: vec![0i16; MAX_FRAME_SAMPLES * channels as usize],
             })
         }
-    }
 
-    /// Decode one Speex frame into 16-bit PCM samples.
-    pub fn decode(&mut self, frame: &[u8]) -> Result<Vec<i16>> {
-        let rc = unsafe {
-            speex_bits_read_from(&mut *self.bits, frame.as_ptr() as *const c_char, frame.len() as c_int);
-            speex_decode_int(self.st, &mut *self.bits, self.buf.as_mut_ptr())
-        };
-        match rc {
-            0 => Ok(self.buf[..self.frame_size].to_vec()),
-            -1 => Err(Error::Speex("end of stream".into())),
-            _ => Err(Error::Speex("corrupt frame".into())),
+        /// Decode one Opus packet into 16-bit PCM samples.
+        pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>> {
+            let n = unsafe {
+                opus_decode(
+                    self.st,
+                    packet.as_ptr(),
+                    packet.len() as i32,
+                    self.buf.as_mut_ptr(),
+                    MAX_FRAME_SAMPLES as c_int,
+                    0,
+                )
+            };
+            if n < 0 {
+                return Err(Error::Opus(strerror(n)));
+            }
+            Ok(self.buf[..n as usize * self.channels].to_vec())
+        }
+
+        /// Synthesise one frame in place of a lost one (packet loss concealment).
+        pub fn conceal(&mut self) -> Result<Vec<i16>> {
+            let n = unsafe {
+                opus_decode(
+                    self.st,
+                    std::ptr::null(),
+                    0,
+                    self.buf.as_mut_ptr(),
+                    FRAME_SAMPLES as c_int,
+                    0,
+                )
+            };
+            if n < 0 {
+                return Err(Error::Opus(strerror(n)));
+            }
+            Ok(self.buf[..n as usize * self.channels].to_vec())
         }
     }
 
-    /// Synthesise one frame in place of a lost one (packet loss concealment).
-    pub fn conceal(&mut self) -> Result<Vec<i16>> {
-        let rc = unsafe { speex_decode_int(self.st, std::ptr::null_mut(), self.buf.as_mut_ptr()) };
-        if rc != 0 {
-            return Err(Error::Speex("concealment failed".into()));
-        }
-        Ok(self.buf[..self.frame_size].to_vec())
-    }
-}
-
-impl Drop for SpeexDecoder {
-    fn drop(&mut self) {
-        unsafe {
-            speex_bits_destroy(&mut *self.bits);
+    impl Drop for OpusDecoder {
+        fn drop(&mut self) {
             if !self.st.is_null() {
-                speex_decoder_destroy(self.st);
+                unsafe { opus_decoder_destroy(self.st) };
                 self.st = std::ptr::null_mut();
             }
         }
     }
 }
+
+#[cfg(feature = "speex")]
+mod speex {
+    use crate::error::{Error, Result};
+    use std::os::raw::{c_char, c_int, c_void};
+
+    const SPEEX_MODEID_WB: c_int = 1;
+    const SPEEX_SET_ENH: c_int = 0;
+    const SPEEX_GET_FRAME_SIZE: c_int = 3;
+
+    /// `struct SpeexBits` from `speex/speex_bits.h`.
+    #[repr(C)]
+    struct SpeexBits {
+        chars: *mut c_char,
+        nb_bits: c_int,
+        char_ptr: c_int,
+        bit_ptr: c_int,
+        owner: c_int,
+        overflow: c_int,
+        buf_size: c_int,
+        reserved1: c_int,
+        reserved2: *mut c_void,
+    }
+
+    #[link(name = "speex")]
+    extern "C" {
+        fn speex_lib_get_mode(mode: c_int) -> *const c_void;
+        fn speex_decoder_init(mode: *const c_void) -> *mut c_void;
+        fn speex_decoder_destroy(st: *mut c_void);
+        fn speex_decoder_ctl(st: *mut c_void, request: c_int, ptr: *mut c_void) -> c_int;
+        fn speex_decode_int(st: *mut c_void, bits: *mut SpeexBits, out: *mut i16) -> c_int;
+        fn speex_bits_init(bits: *mut SpeexBits);
+        fn speex_bits_destroy(bits: *mut SpeexBits);
+        fn speex_bits_read_from(bits: *mut SpeexBits, bytes: *const c_char, len: c_int);
+    }
+
+    /// Speex wideband (16 kHz) decoder for the A1513's microphone frames.
+    pub struct SpeexDecoder {
+        st: *mut c_void,
+        // Boxed so its address stays put: libspeex keeps pointers into it.
+        bits: Box<SpeexBits>,
+        frame_size: usize,
+        buf: Vec<i16>,
+    }
+
+    // The decoder is owned exclusively and libspeex keeps no global state.
+    unsafe impl Send for SpeexDecoder {}
+
+    impl SpeexDecoder {
+        pub fn new() -> Result<Self> {
+            unsafe {
+                let mode = speex_lib_get_mode(SPEEX_MODEID_WB);
+                if mode.is_null() {
+                    return Err(Error::Speex("wideband mode unavailable".into()));
+                }
+                let st = speex_decoder_init(mode);
+                if st.is_null() {
+                    return Err(Error::Speex("decoder init failed".into()));
+                }
+                // Perceptual enhancement: a postfilter that noticeably cleans up
+                // speech at this bitrate.
+                let mut on: c_int = 1;
+                speex_decoder_ctl(st, SPEEX_SET_ENH, &mut on as *mut c_int as *mut c_void);
+                let mut fs: c_int = 0;
+                speex_decoder_ctl(
+                    st,
+                    SPEEX_GET_FRAME_SIZE,
+                    &mut fs as *mut c_int as *mut c_void,
+                );
+
+                let mut bits = Box::new(std::mem::zeroed::<SpeexBits>());
+                speex_bits_init(&mut *bits);
+                Ok(SpeexDecoder {
+                    st,
+                    bits,
+                    frame_size: fs.max(1) as usize,
+                    buf: vec![0i16; fs.max(1) as usize],
+                })
+            }
+        }
+
+        /// Decode one Speex frame into 16-bit PCM samples.
+        pub fn decode(&mut self, frame: &[u8]) -> Result<Vec<i16>> {
+            let rc = unsafe {
+                speex_bits_read_from(
+                    &mut *self.bits,
+                    frame.as_ptr() as *const c_char,
+                    frame.len() as c_int,
+                );
+                speex_decode_int(self.st, &mut *self.bits, self.buf.as_mut_ptr())
+            };
+            match rc {
+                0 => Ok(self.buf[..self.frame_size].to_vec()),
+                -1 => Err(Error::Speex("end of stream".into())),
+                _ => Err(Error::Speex("corrupt frame".into())),
+            }
+        }
+
+        /// Synthesise one frame in place of a lost one (packet loss concealment).
+        pub fn conceal(&mut self) -> Result<Vec<i16>> {
+            let rc =
+                unsafe { speex_decode_int(self.st, std::ptr::null_mut(), self.buf.as_mut_ptr()) };
+            if rc != 0 {
+                return Err(Error::Speex("concealment failed".into()));
+            }
+            Ok(self.buf[..self.frame_size].to_vec())
+        }
+    }
+
+    impl Drop for SpeexDecoder {
+        fn drop(&mut self) {
+            unsafe {
+                speex_bits_destroy(&mut *self.bits);
+                if !self.st.is_null() {
+                    speex_decoder_destroy(self.st);
+                    self.st = std::ptr::null_mut();
+                }
+            }
+        }
+    }
 }
 
 /// Serialise PCM as a RIFF/WAVE file.

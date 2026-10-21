@@ -170,7 +170,10 @@ async fn adapters() -> Result<()> {
         eprintln!("no Bluetooth adapters found");
         return Ok(());
     }
-    println!("{:<8} {:<20} {:<8} {}", "NAME", "ADDRESS", "POWERED", "DISCOVERING");
+    println!(
+        "{:<8} {:<20} {:<8} {}",
+        "NAME", "ADDRESS", "POWERED", "DISCOVERING"
+    );
     for a in found {
         println!(
             "{:<8} {:<20} {:<8} {}",
@@ -194,7 +197,10 @@ async fn scan(seconds: u64, as_json: bool, want: Option<&str>) -> Result<()> {
         eprintln!("nothing found. The remote only advertises briefly after a press.");
         return Ok(());
     }
-    println!("{:<20} {:>6}  {:<8} {:<7} NAME", "ADDRESS", "RSSI", "TYPE", "PAIRED");
+    println!(
+        "{:<20} {:>6}  {:<8} {:<7} NAME",
+        "ADDRESS", "RSSI", "TYPE", "PAIRED"
+    );
     for d in found {
         println!(
             "{:<20} {:>6}  {:<8} {:<7} {}{}",
@@ -203,7 +209,11 @@ async fn scan(seconds: u64, as_json: bool, want: Option<&str>) -> Result<()> {
             d.addr_type,
             d.paired,
             d.name,
-            if d.likely_remote { "  <-- likely a Siri Remote" } else { "" }
+            if d.likely_remote {
+                "  <-- likely a Siri Remote"
+            } else {
+                ""
+            }
         );
     }
     Ok(())
@@ -255,7 +265,10 @@ fn listen(
 
     let result = Session::run(&cfg, |event| {
         match event {
-            Event::Connected { mtu, kernel_rcv_mtu } => emit(
+            Event::Connected {
+                mtu,
+                kernel_rcv_mtu,
+            } => emit(
                 &address,
                 "connected",
                 json!({
@@ -335,11 +348,7 @@ fn listen(
                     "channels": protocol::AUDIO_CHANNELS,
                 });
                 if let Some(dir) = &audio_dir {
-                    let path = dir.join(format!(
-                        "siri-{}-{}.wav",
-                        address.replace(':', ""),
-                        now()
-                    ));
+                    let path = dir.join(format!("siri-{}-{}.wav", address.replace(':', ""), now()));
                     let wav = audio::wav_bytes(
                         &pcm,
                         protocol::AUDIO_SAMPLE_RATE,

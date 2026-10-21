@@ -133,7 +133,11 @@ impl AttSocket {
                     if started.elapsed() < Duration::from_secs(1) {
                         std::thread::sleep(Duration::from_secs(3));
                     }
-                    on_retry(attempt, &e, deadline.saturating_duration_since(Instant::now()));
+                    on_retry(
+                        attempt,
+                        &e,
+                        deadline.saturating_duration_since(Instant::now()),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -158,15 +162,23 @@ impl AttSocket {
             None => [0u8; 6],
         };
         unsafe {
-            let fd: RawFd =
-                libc::socket(AF_BLUETOOTH as libc::c_int, libc::SOCK_SEQPACKET, BTPROTO_L2CAP);
+            let fd: RawFd = libc::socket(
+                AF_BLUETOOTH as libc::c_int,
+                libc::SOCK_SEQPACKET,
+                BTPROTO_L2CAP,
+            );
             if fd < 0 {
                 return Err(Error::Io(last_os_error()));
             }
             let fd = OwnedFd::from_raw_fd(fd);
 
             let local = sockaddr_l2(local, ATT_CID, addr_type);
-            if libc::bind(fd.as_raw_fd(), local.as_ptr() as *const libc::sockaddr, local.len() as u32) < 0 {
+            if libc::bind(
+                fd.as_raw_fd(),
+                local.as_ptr() as *const libc::sockaddr,
+                local.len() as u32,
+            ) < 0
+            {
                 return Err(Error::Io(last_os_error()));
             }
 
@@ -200,7 +212,12 @@ impl AttSocket {
             libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
 
             let peer = sockaddr_l2(raw, ATT_CID, addr_type);
-            if libc::connect(fd.as_raw_fd(), peer.as_ptr() as *const libc::sockaddr, peer.len() as u32) < 0 {
+            if libc::connect(
+                fd.as_raw_fd(),
+                peer.as_ptr() as *const libc::sockaddr,
+                peer.len() as u32,
+            ) < 0
+            {
                 let e = last_os_error();
                 let code = e.raw_os_error().unwrap_or(0);
                 if code != libc::EINPROGRESS && code != libc::EALREADY {
@@ -253,7 +270,12 @@ impl AttSocket {
 
     fn send_pdu(&self, pdu: &[u8]) -> Result<()> {
         let n = unsafe {
-            libc::send(self.fd.as_raw_fd(), pdu.as_ptr() as *const libc::c_void, pdu.len(), 0)
+            libc::send(
+                self.fd.as_raw_fd(),
+                pdu.as_ptr() as *const libc::c_void,
+                pdu.len(),
+                0,
+            )
         };
         if n < 0 {
             return Err(Error::Io(last_os_error()));
@@ -281,7 +303,12 @@ impl AttSocket {
         let cap = (self.mtu as usize).max(1024);
         let mut buf = vec![0u8; cap];
         let n = unsafe {
-            libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, cap, 0)
+            libc::recv(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                cap,
+                0,
+            )
         };
         if n < 0 {
             return Err(Error::Io(last_os_error()));

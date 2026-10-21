@@ -6,6 +6,7 @@ advertises, so you can start it and *then* hold the pairing chord.
 
 Usage:  sudo python3 pair_remote.py [BD_ADDR] [--timeout SECONDS]
 """
+import os
 import sys
 import argparse
 
@@ -60,10 +61,24 @@ class Agent(dbus.service.Object):
 
 
 def find_adapter(bus):
+    # Honor $PAIR_ADAPTER (a BD address like B8:27:.. or a path suffix like
+    # hci1) so we can pair on a specific radio when several are present.
+    want = os.environ.get("PAIR_ADAPTER", "").upper()
     objs = dbus.Interface(bus.get_object(BLUEZ, "/"), OM_IFACE).GetManagedObjects()
+    first = None
     for path, ifaces in objs.items():
-        if ADAPTER_IFACE in ifaces:
+        if ADAPTER_IFACE not in ifaces:
+            continue
+        first = first or path
+        if not want:
             return path
+        addr = str(ifaces[ADAPTER_IFACE].get("Address", "")).upper()
+        if want == addr or path.upper().endswith(want):
+            return path
+    if want and first:
+        print(f"adapter {want} not found; using {first}")
+    if first:
+        return first
     raise SystemExit("no bluetooth adapter found")
 
 

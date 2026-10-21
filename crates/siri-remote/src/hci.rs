@@ -124,7 +124,10 @@ fn dev_id_for(bdaddr: [u8; 6]) -> io::Result<u16> {
             return Ok(id);
         }
     }
-    Err(io::Error::new(io::ErrorKind::NotFound, "no HCI device owns this link"))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no HCI device owns this link",
+    ))
 }
 
 /// Ask the controller to move the link behind `l2cap` to `params`.
@@ -159,7 +162,13 @@ pub fn request_conn_params(l2cap: RawFd, params: &ConnParams) -> io::Result<u16>
     pkt.extend_from_slice(&OP_LE_CONN_UPDATE.to_le_bytes());
     pkt.push(body.len() as u8);
     pkt.extend_from_slice(&body);
-    let n = unsafe { libc::write(sock.as_raw_fd(), pkt.as_ptr() as *const libc::c_void, pkt.len()) };
+    let n = unsafe {
+        libc::write(
+            sock.as_raw_fd(),
+            pkt.as_ptr() as *const libc::c_void,
+            pkt.len(),
+        )
+    };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -173,10 +182,7 @@ mod tests {
     #[test]
     fn le_conn_update_command_layout() {
         let p = ConnParams::VOICE.command(0x0010);
-        assert_eq!(
-            p,
-            [0x10, 0x00, 6, 0, 12, 0, 0, 0, 0xF4, 0x01, 0, 0, 0, 0]
-        );
+        assert_eq!(p, [0x10, 0x00, 6, 0, 12, 0, 0, 0, 0xF4, 0x01, 0, 0, 0, 0]);
     }
 
     #[test]

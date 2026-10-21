@@ -119,6 +119,7 @@ impl Button {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Button> {
         Button::ALL
             .iter()
@@ -224,8 +225,16 @@ pub struct AudioFrame {
 /// resolution is noticeably coarser than X.
 pub fn decode_finger(f: &[u8]) -> Finger {
     let x = ((f[0] as i32 + 255 * (f[1] as i32 & 7)) - 230) / 15;
-    let y = (if f[2] & 128 != 0 { f[2] as i32 } else { f[2] as i32 + 255 }) - 188;
-    Finger { x, y, pressure: f[5] }
+    let y = (if f[2] & 128 != 0 {
+        f[2] as i32
+    } else {
+        f[2] as i32 + 255
+    }) - 188;
+    Finger {
+        x,
+        y,
+        pressure: f[5],
+    }
 }
 
 pub fn is_opus_toc(b: u8) -> bool {
@@ -343,7 +352,8 @@ pub fn parse(data: &[u8]) -> Report {
 #[cfg(test)]
 pub(crate) mod test_frames {
     /// A real A1513 microphone notification (82 bytes, Siri held).
-    pub const SPEEX_NOTIFICATION: &str = "1010377088766f000068e8e8e8e8e8e8e8800034747474747474744480\
+    pub const SPEEX_NOTIFICATION: &str =
+        "1010377088766f000068e8e8e8e8e8e8e8800034747474747474744480\
         1a3a3d7fcf481606815f7d1b46b6b71715964b3865ababababab5ababababab29434507\
         5d82abababab6474600854bc2090ad7a33c";
 
@@ -358,8 +368,8 @@ pub(crate) mod test_frames {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_frames::{unhex, SPEEX_NOTIFICATION};
+    use super::*;
 
     fn buttons_of(data: &[u8]) -> Vec<Button> {
         match parse(data) {
@@ -402,9 +412,18 @@ mod tests {
         t[8] = 188;
         t[11] = 42;
         match parse(&t) {
-            Report::Touch { fingers, pressed, .. } => {
+            Report::Touch {
+                fingers, pressed, ..
+            } => {
                 assert_eq!(fingers.len(), 1);
-                assert_eq!(fingers[0], Finger { x: 0, y: 0, pressure: 42 });
+                assert_eq!(
+                    fingers[0],
+                    Finger {
+                        x: 0,
+                        y: 0,
+                        pressure: 42
+                    }
+                );
                 assert!(pressed);
             }
             other => panic!("expected touch, got {other:?}"),
@@ -446,7 +465,12 @@ mod tests {
         pkt.extend_from_slice(&opus);
         match parse(&pkt) {
             Report::Audio {
-                frame: Some(AudioFrame { codec: Codec::Opus, payload, .. }),
+                frame:
+                    Some(AudioFrame {
+                        codec: Codec::Opus,
+                        payload,
+                        ..
+                    }),
                 ..
             } => assert_eq!(payload, opus),
             other => panic!("expected audio, got {other:?}"),
@@ -460,7 +484,12 @@ mod tests {
         match parse(&data) {
             Report::Audio {
                 buttons,
-                frame: Some(AudioFrame { codec: Codec::Speex, payload, time }),
+                frame:
+                    Some(AudioFrame {
+                        codec: Codec::Speex,
+                        payload,
+                        time,
+                    }),
                 ..
             } => {
                 assert!(buttons.contains(Button::Siri));
@@ -478,7 +507,11 @@ mod tests {
         let mut data = unhex(SPEEX_NOTIFICATION);
         data[1] = 0x00;
         match parse(&data) {
-            Report::Audio { buttons, frame: Some(_), .. } => {
+            Report::Audio {
+                buttons,
+                frame: Some(_),
+                ..
+            } => {
                 assert!(!buttons.contains(Button::Siri))
             }
             other => panic!("expected audio, got {other:?}"),
@@ -507,17 +540,11 @@ mod tests {
 
     #[test]
     fn malformed_payloads_do_not_panic() {
-        for p in [
-            vec![],
-            vec![0u8],
-            vec![0x01, 0x80, 50],
-            vec![0u8; 101],
-            {
-                let mut v = vec![0, 0, 0, 200, 0xB8];
-                v.extend([0u8; 40]);
-                v
-            },
-        ] {
+        for p in [vec![], vec![0u8], vec![0x01, 0x80, 50], vec![0u8; 101], {
+            let mut v = vec![0, 0, 0, 200, 0xB8];
+            v.extend([0u8; 40]);
+            v
+        }] {
             let _ = parse(&p);
         }
     }
@@ -526,8 +553,14 @@ mod tests {
     fn tracks_press_and_release_transitions() {
         let prev = Buttons(0x20);
         let now = Buttons(0x10);
-        assert_eq!(now.newly_pressed(prev).collect::<Vec<_>>(), vec![Button::Siri]);
-        assert_eq!(now.newly_released(prev).collect::<Vec<_>>(), vec![Button::Menu]);
+        assert_eq!(
+            now.newly_pressed(prev).collect::<Vec<_>>(),
+            vec![Button::Siri]
+        );
+        assert_eq!(
+            now.newly_released(prev).collect::<Vec<_>>(),
+            vec![Button::Menu]
+        );
     }
 
     #[test]

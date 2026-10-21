@@ -72,7 +72,9 @@ pub async fn adapters() -> Result<Vec<AdapterInfo>> {
     let session = Session::new().await.map_err(bz)?;
     let mut out = Vec::new();
     for name in session.adapter_names().await.map_err(bz)? {
-        let Ok(a) = session.adapter(&name) else { continue };
+        let Ok(a) = session.adapter(&name) else {
+            continue;
+        };
         out.push(AdapterInfo {
             address: a.address().await.map(|x| x.to_string()).unwrap_or_default(),
             name,
@@ -121,7 +123,9 @@ pub async fn scan(secs: u64, want: Option<&str>) -> Result<Vec<Discovered>> {
             AdapterEvent::PropertyChanged(_) => continue,
             AdapterEvent::DeviceRemoved(_) => continue,
         };
-        let Ok(dev) = adapter.device(addr) else { continue };
+        let Ok(dev) = adapter.device(addr) else {
+            continue;
+        };
 
         let uuids = dev.uuids().await.ok().flatten().unwrap_or_default();
         let name = dev.name().await.ok().flatten().unwrap_or_default();

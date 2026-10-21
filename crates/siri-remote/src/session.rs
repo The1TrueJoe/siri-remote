@@ -120,10 +120,7 @@ impl Session {
     /// returns `false`.
     ///
     /// This blocks; run it on its own thread (or `spawn_blocking`) per remote.
-    pub fn run(
-        cfg: &SessionConfig,
-        mut on_event: impl FnMut(Event) -> bool,
-    ) -> Result<()> {
+    pub fn run(cfg: &SessionConfig, mut on_event: impl FnMut(Event) -> bool) -> Result<()> {
         Self::run_with_retry_hook(cfg, |_, _, _| {}, &mut on_event)
     }
 
@@ -171,13 +168,13 @@ impl Session {
         }) {
             return Ok(());
         }
-        if sock.kernel_rcv_mtu < proto::MIN_MTU {
-            if !on_event(Event::AudioUnavailable {
+        if sock.kernel_rcv_mtu < proto::MIN_MTU
+            && !on_event(Event::AudioUnavailable {
                 mtu: sock.kernel_rcv_mtu,
                 needed: proto::MIN_MTU,
-            }) {
-                return Ok(());
-            }
+            })
+        {
+            return Ok(());
         }
 
         let mut held = Buttons::default();
@@ -242,7 +239,9 @@ impl Session {
                         Report::Audio { buttons, frame, .. } => {
                             // Presses and releases made mid-stream only show
                             // up here, in the frame's button byte.
-                            if !Self::emit_transitions(buttons, &mut held, &mut voice, &mut sock, on_event) {
+                            if !Self::emit_transitions(
+                                buttons, &mut held, &mut voice, &mut sock, on_event,
+                            ) {
                                 return Ok(());
                             }
                             if let Some(frame) = frame {
@@ -254,7 +253,9 @@ impl Session {
                             }
                         }
                         Report::AudioEnd(buttons) => {
-                            if !Self::emit_transitions(buttons, &mut held, &mut voice, &mut sock, on_event) {
+                            if !Self::emit_transitions(
+                                buttons, &mut held, &mut voice, &mut sock, on_event,
+                            ) {
                                 return Ok(());
                             }
                             if let Some(ev) = voice.finish() {
@@ -271,12 +272,16 @@ impl Session {
                             if !on_event(Event::Touch { fingers, pressed }) {
                                 return Ok(());
                             }
-                            if !Self::emit_transitions(buttons, &mut held, &mut voice, &mut sock, on_event) {
+                            if !Self::emit_transitions(
+                                buttons, &mut held, &mut voice, &mut sock, on_event,
+                            ) {
                                 return Ok(());
                             }
                         }
                         Report::Buttons(buttons) => {
-                            if !Self::emit_transitions(buttons, &mut held, &mut voice, &mut sock, on_event) {
+                            if !Self::emit_transitions(
+                                buttons, &mut held, &mut voice, &mut sock, on_event,
+                            ) {
                                 return Ok(());
                             }
                         }
@@ -543,8 +548,10 @@ mod tests {
 
     #[test]
     fn gaps_in_stream_time_count_as_lost_frames() {
-        let mut v = VoiceSession::default();
-        v.last_time = Some(0.10);
+        let v = VoiceSession {
+            last_time: Some(0.10),
+            ..Default::default()
+        };
         assert_eq!(v.missing_before(&speex_at(0.12)), 0);
         assert_eq!(v.missing_before(&speex_at(0.16)), 2);
         // A jump this large is a new stream, not a hole to fill.
@@ -557,7 +564,10 @@ mod tests {
     #[test]
     fn concealment_fills_lost_frames_with_audio() {
         use crate::protocol::test_frames::{unhex, SPEEX_NOTIFICATION};
-        let Report::Audio { frame: Some(first), .. } = proto::parse(&unhex(SPEEX_NOTIFICATION)) else {
+        let Report::Audio {
+            frame: Some(first), ..
+        } = proto::parse(&unhex(SPEEX_NOTIFICATION))
+        else {
             panic!("fixture is not an audio frame");
         };
         let mut v = VoiceSession::default();
@@ -570,7 +580,12 @@ mod tests {
         assert_eq!(chunks.len(), 3, "two concealed, one decoded");
         assert!(chunks.iter().all(|c| c.len() == 320));
         match v.finish() {
-            Some(Event::VoiceEnd { frames, concealed, pcm, .. }) => {
+            Some(Event::VoiceEnd {
+                frames,
+                concealed,
+                pcm,
+                ..
+            }) => {
                 assert_eq!(frames, 2);
                 assert_eq!(concealed, 2);
                 assert_eq!(pcm.len(), 4 * 320);

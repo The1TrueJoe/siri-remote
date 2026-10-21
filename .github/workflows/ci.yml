@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lib:
+    name: siri-remote (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libopus-dev libspeex-dev libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # Strict lints on the library (the cross-platform core); the bluez-only
+      # siri-events is covered by build + test below.
+      - run: cargo clippy -p siri-remote --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo test -p siri-remote --no-default-features
+      - run: cargo test -p siri-remote --no-default-features --features opus
+      - run: cargo test -p siri-remote --no-default-features --features speex
+      - run: cargo build --workspace --release
+
+  # Zephyr module build lands with zephyr/ in Phase 5.
+  # zephyr:
+  #   name: siri_remote zephyr module
+  #   runs-on: ubuntu-latest
+  #   container: zephyrprojectrtos/ci:latest
+  #   strategy:
+  #     matrix:
+  #       board: [esp32s3_devkitm/esp32s3/procpu, xiao_esp32s3/esp32s3/procpu]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: west init -l . && west update
+  #     - run: west build -b ${{ matrix.board }} zephyr/samples/print_events
