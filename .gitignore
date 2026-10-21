@@ -3,3 +3,7 @@ __pycache__/
 *.pklg
 *.btsnoop
 *.wav
+
+# Zephyr build + host test artifacts
+/build
+zephyr/tests/host/proto_test

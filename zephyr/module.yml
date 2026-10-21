@@ -1,0 +1,7 @@
+# Zephyr module manifest for siri_remote.
+# Point west at this repo's zephyr/ dir (ZEPHYR_EXTRA_MODULES or a west.yml
+# project) and the Kconfig/CMake below are picked up automatically.
+name: siri_remote
+build:
+  cmake: .
+  kconfig: Kconfig

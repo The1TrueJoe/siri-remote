@@ -35,15 +35,12 @@ jobs:
       - run: cargo test -p siri-remote --no-default-features --features speex
       - run: cargo build --workspace --release
 
-  # Zephyr module build lands with zephyr/ in Phase 5.
-  # zephyr:
-  #   name: siri_remote zephyr module
-  #   runs-on: ubuntu-latest
-  #   container: zephyrprojectrtos/ci:latest
-  #   strategy:
-  #     matrix:
-  #       board: [esp32s3_devkitm/esp32s3/procpu, xiao_esp32s3/esp32s3/procpu]
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - run: west init -l . && west update
-  #     - run: west build -b ${{ matrix.board }} zephyr/samples/print_events
+  zephyr-decoder:
+    name: zephyr decoder (host unit test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -C zephyr/tests/host run
+      # The full embedded module build is exercised best-effort by the firmware
+      # west build in control4-appletv-remote's release workflow; it needs the
+      # Zephyr SDK + an ESP32-S3 to verify, so it isn't gated here.

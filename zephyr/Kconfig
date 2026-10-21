@@ -1,0 +1,19 @@
+config SIRI_REMOTE
+	bool "Apple TV Siri Remote BLE central"
+	depends on BT_CENTRAL && BT_GATT_CLIENT && BT_SMP
+	help
+	  BLE central driver for the Apple TV Siri Remote (A1513/A1962):
+	  connect, unlock, start the mic stream, and parse buttons/touch/audio.
+	  Requires bonding (BT_SMP) and the settings subsystem for persistent
+	  keys. NOTE: the remote sends 82/101-byte notifications regardless of
+	  the negotiated ATT MTU, so the host RX buffers must be large enough:
+	  set CONFIG_BT_L2CAP_RX_MTU and CONFIG_BT_BUF_ACL_RX_SIZE >= ~110, and
+	  CONFIG_BT_BUF_ACL_RX_COUNT generously (see PROTOCOL.md §7).
+
+if SIRI_REMOTE
+
+module = SIRI_REMOTE
+module-str = siri_remote
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # SIRI_REMOTE
